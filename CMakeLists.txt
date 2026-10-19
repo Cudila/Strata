@@ -1048,7 +1048,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_library(strata_nemotron_kernels STATIC src/kernels/cuda/mamba.cu src/kernels/cuda/nemo_attn.cu
                                                src/kernels/cuda/nemo_moe.cu src/kernels/cuda/nemo_gemm.cu
                                                src/kernels/cuda/nemo_ops.cu src/kernels/cuda/nemo_tc.cu
-                                               src/kernels/cuda/nemo_gemv.cu src/kernels/cuda/nemo_q8.cu)
+                                               src/kernels/cuda/nemo_gemv.cu src/kernels/cuda/nemo_q8.cu
+                                               src/kernels/cuda/nemo_c4.cu)
     target_include_directories(strata_nemotron_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_include_directories(strata_nemotron_kernels PRIVATE third_party/ggml)
     # the prompt's W4A4 GEMMs: the block-scaled FP4 mma is sm_120a-only, so this one file builds for 120a alone
@@ -1084,6 +1085,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(nemo_gemv_bench src/kernels/nemo_gemv_bench.cpp)
     target_include_directories(nemo_gemv_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(nemo_gemv_bench PRIVATE strata_nemotron_kernels ${_strata_gpu_runtime_target})
+    # the C4 column layout of down_proj against today's GEMV, cuBLAS and cuSPARSE (real relu^2 inputs: STRATA_NEMO_ZERO_DUMP)
+    add_executable(nemo_c4_bench src/kernels/nemo_c4_bench.cpp)
+    target_include_directories(nemo_c4_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(nemo_c4_bench PRIVATE strata_nemotron_kernels ${_strata_gpu_runtime_target} CUDA::cublas CUDA::cusparse)
     add_executable(moe_parity src/kernels/moe_parity.cpp)
     target_include_directories(moe_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(moe_parity PRIVATE strata_nemotron_kernels strata_kernels ${_strata_gpu_runtime_target})

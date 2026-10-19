@@ -597,6 +597,8 @@ struct NemoModel::Impl {
     bool zero_stats = std::getenv("STRATA_NEMO_ZERO_STATS") != nullptr;
     std::vector<std::array<uint64_t, 5>> zs;
     std::vector<float> zs_host;
+    FILE* zs_dump = std::getenv("STRATA_NEMO_ZERO_DUMP") ? fopen(std::getenv("STRATA_NEMO_ZERO_DUMP"), "wb") : nullptr;
+    int64_t zs_dumped = 0;
     double prof_ms[9] = {0};
     uint64_t prof_tokens = 0;
     std::chrono::steady_clock::time_point prof_t;
@@ -1750,6 +1752,10 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         for (int64_t i = 0; i < KT; ++i) {
                             if (skip_of[(size_t) where[(size_t) h_ids[(size_t) i]]]) continue;   // a zero expert
                             const float* hrow = I.zs_host.data() + (size_t) i * FF;
+                            if (I.zs_dump && I.zs_dumped < 8192) {   // STRATA_NEMO_ZERO_DUMP=file: the first 8192 rows
+                                fwrite(hrow, sizeof(float), (size_t) FF, I.zs_dump);
+                                ++I.zs_dumped;
+                            }
                             ++z[0];
                             z[1] += (uint64_t) FF;
                             for (int64_t j = 0; j < FF; ++j) z[2] += hrow[j] == 0.0f;

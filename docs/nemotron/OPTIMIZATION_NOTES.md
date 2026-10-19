@@ -244,3 +244,38 @@ What would cut the bytes: a column layout of `down_proj`, bit-exact (the same co
 The catch: the prompt path's FP4 GEMM reads the VRAM slots in ggml layout. A column layout needs either a GEMM loader
 for it or a repack per group on the prompt path, which costs short prompts. It pays more for misses (PCIe / SSD):
 once `up` is computed, only the nonzero columns of `down` need to be copied.
+
+**The C4 column layout of `down_proj`: a prototype** (`src/kernels/cuda/nemo_c4.cu`, `nemo_c4_bench`, 2026-10-19).
+
+The kernel takes real relu² inputs from decode (`STRATA_NEMO_ZERO_DUMP`, 8192 rows, 91.6% zeros) and 1024 × 2688
+NVFP4 matrices:
+1. a compaction kernel lists each input's nonzero columns;
+2. 64 blocks per matrix each take 1/64 of the list and read whole 512-byte columns (lane: 8 rows);
+3. a reduction adds the 64 parts in order (deterministic).
+
+Error against float64: ~1.5e-7, the same as today's GEMV (8.8e-8).
+
+| call | today's GEMV (ggml rows) | C4 | | dense BF16 (cuBLAS) | cuSPARSE SpMM (BF16) |
+|---|---:|---:|---:|---:|---:|
+| 22 matrices (a decode token) | 25.7 µs | 18.4 µs | −29% | 59.9 µs | 125 µs |
+| 88 matrices (a 4-row verify window) | 89.0 µs | 51.2 µs | −42% | 291 µs | — |
+| 132 matrices (a 6-row window) | 114.5 µs | 71.3 µs | −38% | 436 µs | — |
+
+C4 reads 7× fewer bytes than today's GEMV but is only 1.4–1.7× faster. At these sizes (5–30 MB a call) the kernel is
+bound by latency and block scheduling, not DRAM. Splitting the list finer helped up to 64 parts, then the reduction
+cost more.
+
+cuBLAS and cuSPARSE cannot read NVFP4: they need the matrix in BF16 (3.6× the bytes, which does not fit for 20,480
+experts). cuSPARSE also pays a call per expert.
+
+What it would give end to end:
+- `down_proj` is about half of the experts' decode time, and the experts are ~27% of decode;
+- so ~−40% of `down` is ~5% decode.
+
+What integration needs:
+- the RAM arena's `down` permuted at load (29.5 GB, CPU threads);
+- the MTP block's experts converted;
+- a C4 path in every prompt-path consumer of `down`: the FP4 grouped GEMM's B loader (transpose a 128 × 128 nibble
+  tile in shared memory), the CUDA-core path of small chunks, the BF16 dequantization.
+
+The list can come almost free from the `up` kernel's relu² epilogue.
