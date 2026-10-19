@@ -67,3 +67,58 @@ file, or convert one with a current llama.cpp.
 - Update `llama.cpp-glm5next` (or another tree) to a version with `nemotron_omni`, so that a local slot can take images.
 - In strata-nemotron, vision is a separate step: the tower plus the projector, and embeddings in place of the
   `<image>` tokens in the prompt path. Video adds `video_embedder` and token pruning across frames.
+
+## Vision in strata-nemotron (2026-10-19)
+
+Images work end to end: through the server (OpenAI image_url parts, Anthropic image blocks) and through llama-swap.
+
+**The pieces:**
+- **Encoder**: `strata-vision` (tools/vision), built against llama.cpp `098ce526b` (2026-10-19; `nemotron_omni` since
+  `cd0a5b6a1`) with `tools/vision/patches/llama.cpp-nemotron-omni-cpe.patch`, and Unsloth's `mmproj-BF16.gguf`.
+- **The patch** fixes upstream's position embeddings for non-square pictures. RADIO's CPE resizes the 128×128 table to
+  a square of the longer side and takes its top-left rows × cols. Upstream stretched it to rows × cols, which gave a
+  per-token cosine down to 0.32 against NVIDIA's code on a 48×64-patch page.
+- **NVIDIA's tile, in strata-vision.** For `nemotron_omni`, strata-vision picks NVIDIA's tile size itself
+  (`_compute_target_patches`, with Python's round-half-to-even) and resamples like torch's antialiased bicubic. Only
+  then does mtmd get the picture. mtmd's generic dynamic-size rule picks other tiles: a 640×488 photo became 300
+  tokens there, against NVIDIA's 320.
+- **Engine**: `GENI <max_new> [keys] <file> <ids>`. Each `<img><image>…</img>` run of the prompt takes one strata-vision
+  record, in order. The rows replace the token rows in the main model and in the MTP block's input. The conversation
+  reuse matches pictures by their hashes (`img_keys`), so a different picture of the same size is never reused.
+- **Server**: for this tokenizer, each `<image>` the template writes becomes `<img>` + one `<image>` per image token
+  + `</img>`, as in NVIDIA's processor.
+
+**Correctness** (`tools/nemotron/vision_check.py`: strata-vision against `tools/nemotron/vision_naive.py`, a float32
+transcription of NVIDIA's processor, RADIO and projector):
+
+| image | tokens | CPU: rel err / min cos | GPU: rel err / min cos |
+|---|---:|---|---|
+| document 768×1024 | 768 | 0.0039 / 0.9996 | 0.0068 / 0.9986 |
+| chart 1024×512 | 512 | 0.0049 / 0.9998 | 0.0066 / 0.9985 |
+| photo 640×488 (resized to 640×512) | 320 | 0.0091 / 0.9967 | — |
+| square 768×768 | 576 | 0.0029 / 0.9999 | — |
+
+Before the patch, the same document gave rel err 0.258 and min cos 0.32.
+
+**End to end** (greedy, thinking off, through the server). All answers were right:
+
+| input | answer |
+|---|---|
+| invoice | the total ($98.60) and the customer |
+| chart | the tallest bar (orange) |
+| photo | "front page of The New York Times from July 21, 1969 … MEN WALK ON MOON" |
+| two images in one message | the invoice number and the bar count |
+| a 1920×1080 screenshot | the two failed tests |
+| follow-up turn on the screenshot | 2061 of 2107 tokens reused, 146 ms |
+| the same conversation with a mirrored chart | not reused, answered from the new picture |
+
+**Cost:**
+- Encoding on the GPU takes 36 ms (512 tokens) to 463 ms (3300 tokens).
+- The encoder holds 2.9 GB of VRAM, so the engine gets 116 expert slots a layer instead of 140. The 24 GB emulation
+  showed that half the cache costs only a few %.
+- Text after the change is identical: PPL 3.2120 on 8 × 1024, as before.
+
+**Not done:**
+- Video: `video_embedder` and the token pruning across frames.
+- An elastic encoder, which would start with the first picture and give its VRAM back when idle. The engine has no
+  `VRAM` command yet.

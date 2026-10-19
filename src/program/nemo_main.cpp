@@ -11,7 +11,10 @@
 //                 stdout  INFO k=v ... ; READY <context> stop ; per request T <id> ... DONE <generated> <prompt>
 //                         <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused> ; ERR <message>
 //                 stdin   GEN <max_new> [key=value ...] <id,id,...>  (temperature, top_p, top_k, min_p, seed;
-//                         other keys are accepted and ignored); STOP (the running request ends at its next token);
+//                         other keys are accepted and ignored); GENI <max_new> [key=value ...] <file> <id,...>:
+//                         the same with images, the file strata-vision's records in prompt order, each one the rows
+//                         of an <img><image>...</img> run (img_keys=k1,k2: their hashes, for the reuse below);
+//                         STOP (the running request ends at its next token);
 //                         WRAP (the same, for the server's shutdown); QUIT
 //
 // Conversation reuse: after a prompt is read its state is set aside; a request whose prompt starts with that prompt
@@ -85,6 +88,52 @@ int32_t sample(const float* logits, int64_t n, const Sampling& s, std::mt19937_6
         if (r <= 0) return idx[(size_t) i];
     }
     return idx[(size_t) keep - 1];
+}
+
+/// A GENI request's embeddings file: strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats)
+/// one after another, in prompt order.  `rows` gets every record's rows, `counts` each record's n.
+bool read_sve(const std::string& path, int64_t n_embd, std::vector<float>& rows, std::vector<int64_t>& counts,
+              std::string& err) {
+    rows.clear();
+    counts.clear();
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        err = "cannot open the embeddings file " + path;
+        return false;
+    }
+    int32_t h[5];
+    bool ok = true;
+    while (std::fread(h, sizeof h, 1, f) == 1) {
+        if (h[0] != 0x31455653 || h[1] <= 0 || h[4] != n_embd) {
+            err = "the embeddings file " + path + " is not strata-vision's (or its rows are not " +
+                  std::to_string(n_embd) + " wide)";
+            ok = false;
+            break;
+        }
+        const size_t at = rows.size();
+        rows.resize(at + (size_t) h[1] * n_embd);
+        if (std::fread(rows.data() + at, sizeof(float), (size_t) h[1] * n_embd, f) != (size_t) h[1] * n_embd) {
+            err = "the embeddings file " + path + " is cut short";
+            ok = false;
+            break;
+        }
+        counts.push_back(h[1]);
+    }
+    std::fclose(f);
+    return ok;
+}
+
+/// The prompt's images: runs of <image> (18) between <img> (19) and </img> (20), as NVIDIA's processor writes them.
+std::vector<std::pair<int64_t, int64_t>> image_runs(const std::vector<int32_t>& p) {
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    for (size_t i = 1; i < p.size(); ++i) {
+        if (p[i] != 18 || p[i - 1] != 19) continue;
+        size_t j = i;
+        while (j < p.size() && p[j] == 18) ++j;
+        if (j < p.size() && p[j] == 20) runs.push_back({(int64_t) i, (int64_t) (j - i)});
+        i = j;
+    }
+    return runs;
 }
 
 bool parse_ids(const std::string& s, std::vector<int32_t>& out) {
@@ -207,6 +256,8 @@ int run_serve(strata::core::NemoModel& m) {
 
     const std::vector<int32_t> eos = {2, 11};   // </s>, <|im_end|> (generation_config.json)
     std::vector<int32_t> snap_prompt;           // the prompt the model's snapshot is the end of
+    std::vector<std::string> snap_keys;         // the keys of the pictures in snap_prompt
+    const int64_t n_embd = m.geometry().n_embd;
     std::vector<float> logits((size_t) n_vocab);
     for (;;) {
         std::string line;
@@ -221,7 +272,8 @@ int run_serve(strata::core::NemoModel& m) {
         std::istringstream ss(line);
         std::string cmd;
         ss >> cmd;
-        if (cmd != "GEN") {
+        const bool geni = cmd == "GENI";
+        if (cmd != "GEN" && !geni) {
             if (!cmd.empty()) std::printf("ERR unknown command %s\n", cmd.c_str());
             std::fflush(stdout);
             continue;
@@ -230,12 +282,22 @@ int run_serve(strata::core::NemoModel& m) {
         long long max_new = 0;
         ss >> max_new;
         Sampling sp;
-        std::string tok, ids_s;
+        std::string tok, ids_s, emb_path;
+        std::vector<std::string> img_keys;
         bool sampled = false;
         while (ss >> tok) {
             const size_t eq = tok.find('=');
-            if (eq == std::string::npos) { ids_s = tok; continue; }
+            if (eq == std::string::npos) {
+                if (geni && emb_path.empty()) emb_path = tok;   // GENI <max_new> [key=value ...] <file> <ids>
+                else ids_s = tok;
+                continue;
+            }
             const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+            if (k == "img_keys") {   // each image's hash: the conversation reuse matches pictures by them
+                std::stringstream ks(v);
+                for (std::string kk; std::getline(ks, kk, ',');) img_keys.push_back(kk);
+                continue;
+            }
             if (k == "temperature") { sp.temperature = (float) std::atof(v.c_str()); sampled = sp.temperature > 0; }
             else if (k == "top_p") sp.top_p = (float) std::atof(v.c_str());
             else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
@@ -259,11 +321,40 @@ int run_serve(strata::core::NemoModel& m) {
         std::mt19937_64 rng(sp.seed ? sp.seed : (uint64_t) Clock::now().time_since_epoch().count());
         std::string err;
         const auto t0 = Clock::now();
-        // reuse: the previous prompt is a prefix of this one
+        // images (GENI): each <img><image>...</img> run of the prompt takes one record of the file, in order; a GEN
+        // prompt's runs (none from the server) stay plain token rows
+        const std::vector<std::pair<int64_t, int64_t>> runs = geni ? image_runs(prompt)
+                                                                   : std::vector<std::pair<int64_t, int64_t>>();
+        {
+            std::vector<float> rows;
+            std::vector<int64_t> counts;
+            bool img_ok = !geni || read_sve(emb_path, n_embd, rows, counts, err);
+            if (img_ok && counts.size() != runs.size()) {
+                err = "the prompt has " + std::to_string(runs.size()) + " images and the embeddings file " +
+                      std::to_string(counts.size());
+                img_ok = false;
+            }
+            for (size_t i = 0; img_ok && i < runs.size(); ++i)
+                if (counts[i] != runs[i].second) {
+                    err = "image " + std::to_string(i + 1) + " has " + std::to_string(runs[i].second) +
+                          " <image> tokens in the prompt and " + std::to_string(counts[i]) + " rows in the file";
+                    img_ok = false;
+                }
+            if (!img_ok || !m.set_image_rows(rows.data(), runs, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+        }
+        // an image's key ("?" when the server sent none: such a picture never matches)
+        const auto key_of = [&](size_t i) { return i < img_keys.size() ? img_keys[i] : std::string("?"); };
+        // reuse: the previous prompt is a prefix of this one, its pictures the same ones
         size_t reused = 0;
-        const bool cont = !snap_prompt.empty() && m.snapshot_pos() == (int64_t) snap_prompt.size() &&
-                          snap_prompt.size() <= prompt.size() &&
-                          std::equal(snap_prompt.begin(), snap_prompt.end(), prompt.begin());
+        bool cont = !snap_prompt.empty() && m.snapshot_pos() == (int64_t) snap_prompt.size() &&
+                    snap_prompt.size() <= prompt.size() &&
+                    std::equal(snap_prompt.begin(), snap_prompt.end(), prompt.begin());
+        for (size_t i = 0; cont && i < snap_keys.size(); ++i)
+            cont = snap_keys[i] != "?" && key_of(i) == snap_keys[i];
         // the snapshot goes at the end of the prompt's last COMPLETE message (after its <|im_end|> and newline), not at
         // the prompt's end: the next turn re-renders this turn's generation prompt (<|im_start|>assistant\n<think>\n)
         // as the answer it became, so only the messages before it are a prefix the next prompt will share
@@ -292,6 +383,9 @@ int run_serve(strata::core::NemoModel& m) {
             if (ok) {
                 m.snapshot();
                 snap_prompt.assign(prompt.begin(), prompt.begin() + boundary);
+                snap_keys.clear();   // the pictures the snapshot has read
+                for (size_t i = 0; i < runs.size() && runs[i].first + runs[i].second <= boundary; ++i)
+                    snap_keys.push_back(key_of(i));
             }
         }
         feed((int64_t) prompt.size());
@@ -525,6 +619,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-slots") o.expert_slots = std::atoll(next());
         else if (a == "--kv-base") o.kv_base = std::atoll(next());
         else if (a == "--serve") serve = true;
+        else if (a == "--vision") {}   // the server adds it with a "vision" section: GENI is always taken
         else if (a == "--ppl") ppl = next();
         else if (a == "--bench") bench = next();
         else if (a == "--gen") gen = std::atoll(next());

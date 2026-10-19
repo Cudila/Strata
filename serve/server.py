@@ -3975,8 +3975,13 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            # Nemotron-H (strata-nemotron) marks a picture with <image> between <img> and </img>, not <|image_pad|>
+            pad_ids = self.tok.encode(IMAGE_PAD, parse_special=True)
+            nemo_img = [self.tok.encode(s, parse_special=True) for s in ("<img>", "<image>", "</img>")]
+            nemotron = len(pad_ids) != 1 and all(len(x) == 1 for x in nemo_img)
+            if not nemotron:
+                pad = pad_ids[0]
+                start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):
@@ -4001,7 +4006,20 @@ class Service:
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
-            for j, t in enumerate(ids):
+            if nemotron:
+                # the template writes one <image> per picture (none when the text already holds <image> markers: then
+                # those are the pictures' places, as NVIDIA's processor reads them), each one becomes
+                # <img> + one <image> per image token + </img>
+                (o_id,), (m_id,), (c_id,) = nemo_img
+                if ids.count(m_id) != len(encoded):
+                    raise ValueError("the prompt and its images do not match")
+                for t in ids:
+                    if t == m_id:
+                        out += [o_id] + [m_id] * encoded[k][1] + [c_id]
+                        k += 1
+                    else:
+                        out.append(t)
+            for j, t in enumerate([] if nemotron else ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):

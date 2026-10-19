@@ -2,7 +2,8 @@
 
 A fork of [Strata](https://github.com/Niko1221/Strata). Strata is an inference engine built for large MoE models on
 one consumer GPU, with the experts in system RAM. This fork adds **NVIDIA Nemotron 3.5 Super**, a hybrid of Mamba-2,
-latent MoE (512 experts, top-22) and 8 full-attention layers. It is text only for now. Strata's existing models are
+latent MoE (512 experts, top-22) and 8 full-attention layers, with images (the RADIO encoder through strata-vision).
+Strata's existing models are
 untouched: the new code sits behind its own architecture in the loader and its own engine binary. On swift15
 (Qwen3.8-Flash-Next), the logits after the prompt are bit-identical to upstream, and so are greedy outputs and the
 tokenizer.
@@ -102,9 +103,28 @@ tokenizer folder comes from the GGUF: `python tools/strata_tokenizer.py --gguf m
 
 Requirements: an RTX 50-series GPU (sm_120) with 32 GB, 128 GB of RAM, CUDA 13 (built with 13.3), Linux.
 
+### Images
+
+The image encoder is `strata-vision` with Unsloth's `mmproj-BF16.gguf`
+(unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF), built against llama.cpp `098ce526b` or later with one patch:
+upstream stretches RADIO's position table on non-square pictures, and the patch makes it crop as NVIDIA's code does.
+
+```
+git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout 098ce526b
+git -C ../llama.cpp apply $PWD/tools/vision/patches/llama.cpp-nemotron-omni-cpe.patch
+cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=$PWD/../llama.cpp \
+  -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_PORTABLE=OFF
+cmake --build build-vision -j --target strata-vision
+```
+
+Put `mmproj-BF16.gguf` in `models/`. The example config's `"vision"` section then starts the encoder on the GPU
+(2.9 GB of VRAM: the expert cache gets 116 slots a layer instead of 140). Encoding takes 36–463 ms per picture,
+512–3300 tokens. `tools/nemotron/vision_check.py` compares the encoder with a float32 transcription of NVIDIA's code
+(per-token cosine ≥ 0.998). Details: `docs/nemotron/VISION_MMPROJ.md`.
+
 ## Not done
 
-- Vision and video.
+- Video (the encoder's two-frame path and the token pruning across frames).
 - Windows, AMD/HIP, other GPUs and smaller RAM sizes: not built or tested.
 - Attention reaches ~40% of its ceiling: register-bound, one block per SM. At 1M, attention is most of the prompt
   time.

@@ -25,6 +25,7 @@
 #include <unistd.h>
 #endif
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,83 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     img = rest.substr(0, sp);
     out = rest.substr(sp + 1);
     return !img.empty() && !out.empty();
+}
+
+// ---- Nemotron 3.5 Super VL (projector nemotron_omni): NVIDIA's image processor picks the tile itself, and mtmd's
+// generic dynamic-size rule picks another one (it rounds 488 px down to 480 where NVIDIA rounds up to 512).  So the
+// picture is brought to NVIDIA's size here, with NVIDIA's resampling (torch bicubic, antialias), and mtmd gets a tile
+// it keeps as it is.  From image_processing_nemotron_h_omni.py: patch 16, pixel shuffle 2, 1024..13312 patches.
+
+// _compute_target_patches: (w, h) in patches.  Python's round() is round-half-to-even, as nearbyint here.
+void nvidia_tile(int w, int h, int& wp, int& hp) {
+    const int ps = 16, merge = 2, min_p = 1024;
+    const double available = std::max(std::min(std::max((16384.0 - 4) * merge * merge, (double) min_p), 13312.0),
+                                      (double) min_p);
+    const double ph0 = std::nearbyint(h / (double) ps + 0.5), pw0 = std::nearbyint(w / (double) ps + 0.5);
+    const double f = std::min(std::sqrt(available / (ph0 * pw0)), 1.0);
+    long th = (long) std::floor(f * ph0), tw = (long) std::floor(f * pw0);
+    if (available > min_p && th * tw < min_p) {
+        const double up = std::sqrt(min_p / (double) (th * tw));
+        th = (long) std::ceil(up * th);
+        tw = (long) std::ceil(up * tw);
+    }
+    long r = th % merge;
+    if (r) th = (th + merge - r) * tw <= available ? th + merge - r : std::max<long>(merge, th - r);
+    r = tw % merge;
+    if (r) tw = th * (tw + merge - r) <= available ? tw + merge - r : std::max<long>(merge, tw - r);
+    wp = (int) tw;
+    hp = (int) th;
+}
+
+// torch's antialiased bicubic (PIL's filter: a = -0.5, support 2 x the downscale), along one axis of a float image
+void aa_axis(const std::vector<float>& in, int w, int h, int c, int out_len, bool horizontal, std::vector<float>& out) {
+    const int in_len = horizontal ? w : h;
+    const double scale = (double) in_len / out_len, fs = std::max(scale, 1.0), support = 2.0 * fs;
+    const auto cubic = [](double x) {
+        const double a = -0.5;
+        x = std::fabs(x);
+        return x < 1.0 ? ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+                       : x < 2.0 ? (((x - 5.0) * x + 8.0) * x - 4.0) * a : 0.0;
+    };
+    const int ow = horizontal ? out_len : w, oh = horizontal ? h : out_len;
+    out.assign((size_t) ow * oh * c, 0.0f);
+    std::vector<double> wt;
+    for (int i = 0; i < out_len; ++i) {
+        const double center = scale * (i + 0.5);
+        const int x0 = std::max((int) (center - support + 0.5), 0);
+        const int x1 = std::min((int) (center + support + 0.5), in_len);
+        wt.assign((size_t) (x1 - x0), 0.0);
+        double total = 0.0;
+        for (int j = x0; j < x1; ++j) total += wt[(size_t) (j - x0)] = cubic((j - center + 0.5) / fs);
+        for (double& v : wt) v = total != 0.0 ? v / total : 0.0;
+        const int other = horizontal ? h : w;
+        for (int o = 0; o < other; ++o)
+            for (int ch = 0; ch < c; ++ch) {
+                double s = 0.0;
+                for (int j = x0; j < x1; ++j) {
+                    const size_t src = horizontal ? ((size_t) o * w + j) * c + ch : ((size_t) j * w + o) * c + ch;
+                    s += wt[(size_t) (j - x0)] * in[src];
+                }
+                const size_t dst = horizontal ? ((size_t) o * ow + i) * c + ch : ((size_t) i * ow + o) * c + ch;
+                out[dst] = (float) s;
+            }
+    }
+}
+
+// RGB bytes (w x h) -> NVIDIA's tile size, rounded back to bytes; empty when it already has that size
+std::vector<unsigned char> nvidia_resize(const unsigned char* rgb, int w, int h, int& ow, int& oh) {
+    int wp = 0, hp = 0;
+    nvidia_tile(w, h, wp, hp);
+    ow = wp * 16;
+    oh = hp * 16;
+    if (ow == w && oh == h) return {};
+    std::vector<float> a((size_t) w * h * 3), b, d;
+    for (size_t i = 0; i < a.size(); ++i) a[i] = rgb[i];
+    aa_axis(a, w, h, 3, ow, true, b);    // torch: width first, then height
+    aa_axis(b, ow, h, 3, oh, false, d);
+    std::vector<unsigned char> out(d.size());
+    for (size_t i = 0; i < d.size(); ++i) out[i] = (unsigned char) std::clamp(std::lround(d[i]), 0L, 255L);
+    return out;
 }
 
 }  // namespace
@@ -143,11 +221,14 @@ int main(int argc, char** argv) {
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
+    bool nemotron = false;   // projector nemotron_omni: NVIDIA's tile size and resampling (nvidia_resize)
     {
         gguf_init_params gp{true, nullptr};
         gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
         const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
         if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
+        const int64_t pk = gg ? gguf_find_key(gg, "clip.projector_type") : -1;
+        if (pk >= 0) nemotron = std::string(gguf_get_val_str(gg, pk)) == "nemotron_omni";
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
@@ -193,6 +274,16 @@ int main(int argc, char** argv) {
         mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
                                                                             mtmd_helper_init_opt_default());
         if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
+        if (nemotron) {   // NVIDIA's tile (see nvidia_resize); mtmd keeps a tile of that size as it is
+            int ow = 0, oh = 0;
+            const std::vector<unsigned char> px = nvidia_resize(mtmd_bitmap_get_data(bw.bitmap),
+                                                                (int) mtmd_bitmap_get_nx(bw.bitmap),
+                                                                (int) mtmd_bitmap_get_ny(bw.bitmap), ow, oh);
+            if (!px.empty()) {
+                mtmd_bitmap_free(bw.bitmap);
+                bw.bitmap = mtmd_bitmap_init((uint32_t) ow, (uint32_t) oh, px.data());
+            }
+        }
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         const std::string prompt = mtmd_default_marker();
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
@@ -211,7 +302,11 @@ int main(int argc, char** argv) {
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
             // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            if (nx * ny != n && !mtmd_decode_use_mrope(ctx)) {   // no 2-D positions (nemotron_omni): one row
+                nx = n;
+                ny = 1;
+            }
             if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;

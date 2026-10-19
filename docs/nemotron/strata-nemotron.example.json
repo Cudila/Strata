@@ -39,5 +39,11 @@
     "top_p": 0.95,
     "top_k": 64,
     "min_p": 0.0
+  },
+  "vision": {
+    "exe": "build-vision/bin/strata-vision",
+    "mmproj": "models/mmproj-BF16.gguf",
+    "model": "models/Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf",
+    "gpu": true
   }
 }

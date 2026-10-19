@@ -361,6 +361,22 @@ struct NemoModel::Impl {
     uint16_t* embd_stage = nullptr;   ///< pinned host staging for the token rows
     uint16_t* embd_pinned = nullptr;  ///< the embedding table, page-locked (else rows come from the mapping)
     std::vector<uint16_t*> host_pinned;
+    // images (set_image_rows): runs of (absolute position, count, first row), their rows page-locked
+    struct ImgRun {
+        int64_t pos, n, row;
+    };
+    std::vector<ImgRun> img_runs;
+    float* img_host = nullptr;
+    size_t img_cap = 0;   ///< floats
+    /// The image rows among T rows that start at absolute position p0, copied over `x` (device, E floats a row).
+    void img_overlay(float* x, int64_t p0, int64_t T, int64_t E, cudaStream_t s) {
+        for (const ImgRun& r : img_runs) {
+            const int64_t a = std::max(r.pos, p0), b = std::min(r.pos + r.n, p0 + T);
+            if (a < b)
+                cudaMemcpyAsync(x + (a - p0) * E, img_host + (size_t) (r.row + a - r.pos) * E,
+                                (size_t) (b - a) * E * sizeof(float), cudaMemcpyHostToDevice, s);
+        }
+    }
     // snapshot
     std::vector<float*> snap_state, snap_conv;
     bool pinned = false;
@@ -784,7 +800,38 @@ NemoModel::~NemoModel() {
     if (impl_->arena) cudaFreeHost(impl_->arena);
     if (impl_->embd_stage) cudaFreeHost(impl_->embd_stage);
     if (impl_->embd_pinned) cudaFreeHost(impl_->embd_pinned);
+    if (impl_->img_host) cudaFreeHost(impl_->img_host);
     if (impl_->st) cudaStreamDestroy(impl_->st);
+}
+
+bool NemoModel::set_image_rows(const float* rows, const std::vector<std::pair<int64_t, int64_t>>& runs, std::string& err) {
+    Impl& I = *impl_;
+    const int64_t E = g_.n_embd;
+    NCK(cudaStreamSynchronize(I.st));   // a copy from the previous rows may still be in flight
+    I.img_runs.clear();
+    int64_t total = 0;
+    for (const auto& r : runs) {
+        if (r.first < 0 || r.second <= 0 || r.first + r.second > max_ctx_) {
+            err = "an image run lies outside the context";
+            return false;
+        }
+        I.img_runs.push_back({r.first, r.second, total});
+        total += r.second;
+    }
+    if ((size_t) (total * E) > I.img_cap) {
+        if (I.img_host) cudaFreeHost(I.img_host);
+        I.img_host = nullptr;
+        I.img_cap = 0;
+        if (cudaMallocHost((void**) &I.img_host, (size_t) total * E * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            I.img_runs.clear();
+            err = "no page-locked memory for the image rows";
+            return false;
+        }
+        I.img_cap = (size_t) (total * E);
+    }
+    if (total) std::memcpy(I.img_host, rows, (size_t) total * E * sizeof(float));
+    return true;
 }
 
 bool NemoModel::load(const NemoOptions& opt, std::string& err) {
@@ -1408,6 +1455,7 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
         uint16_t* d_emb = (uint16_t*) I.q;   // q has room for C * 4096 floats: the BF16 rows fit in its first half
         NCK(cudaMemcpyAsync(d_emb, I.embd_stage, (size_t) T * E * sizeof(uint16_t), cudaMemcpyHostToDevice, st));
         strata::kernels::nemo_bf16_rows_to_f32(d_emb, I.x, T, E, st);
+        I.img_overlay(I.x, pos_, T, E, st);
 
         I.mark(-1);
         for (Block& b : I.blocks) {
@@ -2137,6 +2185,7 @@ bool NemoModel::mtp_rows(const int32_t* toks, const float* h, int64_t n, int64_t
     uint16_t* d_emb = (uint16_t*) M.a;
     NCK(cudaMemcpyAsync(d_emb, M.stage, (size_t) n * E * sizeof(uint16_t), cudaMemcpyHostToDevice, st));
     strata::kernels::nemo_bf16_rows_to_f32(d_emb, M.e, n, E, st);
+    I.img_overlay(M.e, pos0 + 1, n, E, st);   // row t pairs h at pos0 + t with the token at pos0 + t + 1
     // u = eh_proj([enorm(e), hnorm(h)])
     strata::kernels::nemo_rms_norm_rows(M.e, M.enorm, M.u, n, E, eps, st);
     strata::kernels::nemo_rms_norm_rows(h, M.hnorm, M.hn, n, E, eps, st);

@@ -1,0 +1,31 @@
+# For llama.cpp 098ce526b (2026-10-19; nemotron_omni since cd0a5b6a1): RADIO's CPE crop for non-square pictures.
+# Apply: git -C <llama.cpp> apply <this file>
+diff --git a/tools/mtmd/models/nemotron-omni.cpp b/tools/mtmd/models/nemotron-omni.cpp
+index c4b1bff40..7f9b9c75c 100644
+--- a/tools/mtmd/models/nemotron-omni.cpp
++++ b/tools/mtmd/models/nemotron-omni.cpp
+@@ -31,7 +31,23 @@ ggml_cgraph * clip_graph_nemotron_omni::build() {
+ 
+     ggml_tensor * inp = build_inp_with_temporal_merge();
+ 
+-    inp = ggml_add(ctx0, inp, resize_position_embeddings(GGML_SCALE_MODE_BILINEAR));
++    // RADIO's CPE (modeling_radio.py _interpolate_position_embedding): the 128x128 table is resized to a SQUARE of the
++    // longer side and its top-left (rows x cols) part taken - not stretched to rows x cols, which on a non-square
++    // picture shifts every position (measured: cosine down to 0.3 per token against NVIDIA's code on a 48x64 page)
++    {
++        ggml_tensor * pos = model.position_embeddings;
++        const int h = img.ny() / patch_size, w = img.nx() / patch_size, m = std::max(h, w);
++        const int side = (int) std::sqrt(pos->ne[1]);
++        if (h != side || w != side) {
++            pos = ggml_reshape_3d(ctx0, pos, n_embd, side, side);
++            pos = ggml_permute(ctx0, pos, 2, 0, 1, 3);                           // (side, side, n_embd)
++            pos = ggml_interpolate(ctx0, ggml_cont(ctx0, pos), m, m, n_embd, 1, GGML_SCALE_MODE_BILINEAR);
++            pos = ggml_view_3d(ctx0, pos, w, h, n_embd, pos->nb[1], pos->nb[2], 0);   // the top-left w x h
++            pos = ggml_permute(ctx0, ggml_cont(ctx0, pos), 1, 2, 0, 3);          // (n_embd, w, h)
++            pos = ggml_cont_2d(ctx0, pos, n_embd, w * h);
++        }
++        inp = ggml_add(ctx0, inp, pos);
++    }
+     cb(inp, "inp_pos", -1);
+ 
+     inp = ggml_concat(ctx0, model.class_embedding, inp, 1);

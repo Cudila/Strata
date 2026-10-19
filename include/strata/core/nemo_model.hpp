@@ -69,6 +69,10 @@ public:
     bool forward(const int32_t* tokens, int64_t n, float* logits, std::string& err);
     /// forward() that writes every row's logits: `all` is n * n_vocab (perplexity, comparisons).
     bool forward_all(const int32_t* tokens, int64_t n, float* all, std::string& err);
+    /// Images: rows of n_embd floats that take the place of the token rows at runs of absolute positions (start,
+    /// count), the runs' rows one after another in `rows`; in the main model and in the MTP block's input alike.
+    /// They hold until the next call (an empty `runs` clears them).
+    bool set_image_rows(const float* rows, const std::vector<std::pair<int64_t, int64_t>>& runs, std::string& err);
 
     /// The current state (Mamba states and conv histories, position, the last logits) set aside / put back.  The K/V
     /// cells below the snapshot's position are untouched by later tokens only if they were not overwritten: restore is

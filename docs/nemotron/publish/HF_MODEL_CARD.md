@@ -2,7 +2,7 @@
 base_model:
 - nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
 base_model_relation: quantized
-pipeline_tag: text-generation
+pipeline_tag: image-text-to-text
 tags:
 - nemotron-3.5
 - nemotron-h
@@ -25,8 +25,10 @@ license_link: https://openmdw.ai/license/1-1/
 > instructions (`mma … kind::mxf4nvf4.block_scale`, NVFP4 × NVFP4 with its native scales), which no earlier
 > generation has. The engine is compiled for `sm_120a` and does not run on RTX 40/30-series or on AMD.
 >
-> **Vision is in progress.** The text model is ready. The image path is being added to strata-nemotron: the RADIO
-> encoder, its projector, and the image embeddings in the prompt. This card will be updated when it is.
+> **Vision works.** Images go through strata-vision with Unsloth's
+> [`mmproj-BF16.gguf`](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) and a patched
+> llama.cpp (see *Images* below). Its embeddings match NVIDIA's own code to a per-token cosine of ≥ 0.998. Video is
+> not done yet.
 
 This repo has a GGUF of the text model of
 [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
@@ -36,7 +38,7 @@ pinned RAM, a VRAM cache in front of them, and every NVFP4 GEMM of the prompt on
 
 The routed experts are NVIDIA's NVFP4 values, bit for bit, repacked to ggml's `NVFP4` without loss. The 1.6 GB
 multi-token-prediction (MTP) block is kept: it is what takes decode from ~100 to ~186 t/s. The vision tower is not
-in this file (see the note above).
+in this file: it is Unsloth's mmproj (see *Images*).
 
 ## Performance
 
@@ -110,7 +112,7 @@ greedy). strata-nemotron and llama.cpp each got **25/25** correct, and 21 of the
 | **attention q/k/v/o, `lm_head`** (FP8 in the checkpoint) | Q8_0 |
 | **router, shared experts, latent fc1/fc2, norms, embeddings** | BF16 / F32, as in the checkpoint |
 | **MTP block** | included (1 layer, its own 512 experts) |
-| **vision tower** | not included |
+| **vision tower** | not in this file: Unsloth's `mmproj-BF16.gguf` + strata-vision |
 | **shards** | 2 (44.3 GB + 27.3 GB), `gguf-split` |
 
 ## How to run it
@@ -148,6 +150,31 @@ it.
 On startup the engine prints `loaded in … s: dense 6.63 GiB in VRAM, 140 expert slots per MoE layer (16.1 GiB), K/V
 65536 cells (grows to 1048576), experts page-locked in place`. On a 32 GB card a slot count well below 140 means
 something else holds VRAM.
+
+### Images
+
+The encoder is a separate process, `strata-vision`. It uses
+[Unsloth's `mmproj-BF16.gguf`](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) and is
+built against llama.cpp `098ce526b` with the patch in the fork:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout 098ce526b
+git -C ../llama.cpp apply $PWD/tools/vision/patches/llama.cpp-nemotron-omni-cpe.patch
+cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=$PWD/../llama.cpp \
+    -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_PORTABLE=OFF
+cmake --build build-vision -j --target strata-vision
+```
+
+With `mmproj-BF16.gguf` in `models/`, the example config's `"vision"` section starts the encoder. The server then
+takes OpenAI `image_url` parts and Anthropic image blocks.
+
+| | |
+| :--- | :--- |
+| **tokens a picture** | 256–3,328: NVIDIA's dynamic tile, 1,024–13,312 patches of 16 px |
+| **encode time (GPU)** | 36 ms at 512 tokens, 238 ms at 2,040, 463 ms at 3,300 |
+| **VRAM** | 2.9 GB for the encoder; the expert cache drops from 140 to 116 slots a layer |
+| **accuracy** | against a float32 transcription of NVIDIA's processor + RADIO + projector: rel err 0.003–0.009, per-token cosine ≥ 0.998 (`tools/nemotron/vision_check.py`) |
+| **follow-ups** | a turn after a picture reuses the state (2,061 of 2,107 tokens, 146 ms); a different picture of the same size is never reused |
 
 Notes that cost time if you miss them:
 
@@ -243,8 +270,9 @@ mostly experts whose weight is too small to matter, and long prompts are bound b
 
 ## Caveats
 
-* Text only for now: vision is in progress (see the note at the top). Until then, for images, Unsloth's
-  `mmproj-BF16.gguf` (projector `nemotron_omni`, current llama.cpp) carries the tower.
+* Images work, video does not yet. Stock llama.cpp's `nemotron_omni` stretches RADIO's position table on
+  non-square pictures (per-token cosine down to 0.32 against NVIDIA's code). The fork ships a patch for it.
+  strata-vision also uses NVIDIA's own tile size and resampling, which differ from mtmd's generic dynamic size.
 * Blackwell (sm_120) only: the engine's kernels use FP4 tensor-core instructions that earlier GPUs do not have.
 * One machine, one card (*Tested hardware*). The 24 GB row is an emulation; the smaller rows follow from the
   engine's own refusal message.
