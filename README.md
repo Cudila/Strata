@@ -1,7 +1,7 @@
 > **This is strata-nemotron**, a fork of Strata that adds **NVIDIA Nemotron 3.5 Super (120B-A12B)** on one RTX 5090:
 > prefill 9.5K tok/s at 32K, decode 95–109 tok/s and 118–186 with MTP, context up to 1M. Start at
 > [docs/nemotron/README.md](docs/nemotron/README.md); weights:
-> [Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-GGUF](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-GGUF).
+> [Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell).
 > Everything below is upstream Strata's README, unchanged.
 
 <h1 align="center">Strata</h1>

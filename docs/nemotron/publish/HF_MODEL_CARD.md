@@ -17,11 +17,18 @@ license_name: openmdw-1.1
 license_link: https://openmdw.ai/license/1-1/
 ---
 
-# Nemotron-3.5-Super-120B-A12B — NVFP4 GGUF for one 32 GB card (strata-nemotron)
+# Nemotron-3.5-Super-120B-A12B — NVFP4 + Strata engine for one RTX 50-series card
 
 ### **186 t/s decode and 9,575 t/s prefill at 32K** on one RTX 5090 with the experts in RAM: 6× llama.cpp's decode on the same weights, with NVIDIA's own NVFP4 experts and the MTP head kept.
 
-This repo has a text-only GGUF of
+> **Blackwell only: RTX 50-series (sm_120).** Every optimization of the engine is built on Blackwell's FP4 tensor-core
+> instructions (`mma … kind::mxf4nvf4.block_scale`, NVFP4 × NVFP4 with its native scales), which no earlier
+> generation has. The engine is compiled for `sm_120a` and does not run on RTX 40/30-series or on AMD.
+>
+> **Vision is in progress.** The text model is ready. The image path is being added to strata-nemotron: the RADIO
+> encoder, its projector, and the image embeddings in the prompt. This card will be updated when it is.
+
+This repo has a GGUF of the text model of
 [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
 made for [strata-nemotron](https://github.com/Cudila/Strata). That is a fork of the
 [Strata](https://github.com/Niko1221/Strata) engine that runs this model on one consumer card: 63 GB of experts in
@@ -29,7 +36,7 @@ pinned RAM, a VRAM cache in front of them, and every NVFP4 GEMM of the prompt on
 
 The routed experts are NVIDIA's NVFP4 values, bit for bit, repacked to ggml's `NVFP4` without loss. The 1.6 GB
 multi-token-prediction (MTP) block is kept: it is what takes decode from ~100 to ~186 t/s. The vision tower is not
-included.
+in this file (see the note above).
 
 ## Performance
 
@@ -230,8 +237,9 @@ mostly experts whose weight is too small to matter, and long prompts are bound b
 
 ## Caveats
 
-* Text only. For images, Unsloth's `mmproj-BF16.gguf` (projector `nemotron_omni`, current llama.cpp) carries the
-  tower. strata-nemotron has no vision yet.
+* Text only for now: vision is in progress (see the note at the top). Until then, for images, Unsloth's
+  `mmproj-BF16.gguf` (projector `nemotron_omni`, current llama.cpp) carries the tower.
+* Blackwell (sm_120) only: the engine's kernels use FP4 tensor-core instructions that earlier GPUs do not have.
 * One machine, one card (*Tested hardware*). The 24 GB row is an emulation; the smaller rows follow from the
   engine's own refusal message.
 * PPL ×1.016 against the checkpoint is a wikitext mean. No downstream benchmarks were run beyond the 25-prompt check.

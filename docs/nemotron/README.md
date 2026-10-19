@@ -7,7 +7,7 @@ untouched: the new code sits behind its own architecture in the loader and its o
 (Qwen3.8-Flash-Next), the logits after the prompt are bit-identical to upstream, and so are greedy outputs and the
 tokenizer.
 
-Weights: [https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-GGUF](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-GGUF). `Nemotron-3.5-Super-120B-A12B-NVFP4`, a 71.6 GB GGUF in two shards: NVIDIA's NVFP4 experts kept as they are, the MTP block included.
+Weights: [https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell). `Nemotron-3.5-Super-120B-A12B-NVFP4`, a 71.6 GB GGUF in two shards: NVIDIA's NVFP4 experts kept as they are, the MTP block included.
 
 ## Numbers
 
