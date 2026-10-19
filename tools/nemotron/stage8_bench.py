@@ -57,7 +57,7 @@ for n in (4096, 32768, 131072):
         rows.append(("swift15", n, spec, pf.group(1) if pf else "?", dc.group(1) if dc else "?", tpw, pk["vram"], pk["rss"]))
         print(rows[-1], flush=True)
         if not pf: print(out[-1500:])
-print("\n| модель | контекст | MTP | prefill, т/с | decode, т/с | токенов за окно | VRAM пик, МиБ | RSS пик, МиБ |")
+print("\n| model | context | MTP | prefill, tok/s | decode, tok/s | tokens a window | VRAM peak, MiB | RSS peak, MiB |")
 print("|---|---:|---|---:|---:|---:|---:|---:|")
 for r in rows:
-    print(f"| {r[0]} | {r[1] // 1024}K | {'да (' + str(r[2]) + ')' if r[2] else 'нет'} | {r[3]} | {r[4]} | {r[5]} | {r[6]} | {r[7]} |")
+    print(f"| {r[0]} | {r[1] // 1024}K | {'yes (' + str(r[2]) + ')' if r[2] else 'no'} | {r[3]} | {r[4]} | {r[5]} | {r[6]} | {r[7]} |")

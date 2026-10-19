@@ -1,75 +1,84 @@
-# strata-nemotron, этапы 2–4: ядра Mamba-2, attention и MoE против послойных референсов
+# strata-nemotron, stages 2–4: Mamba-2, attention and MoE kernels against per-layer references
 
-Дата: 2026-10-17. Все тесты — на реальных весах и реальных активациях (вход блока L взят из цепочки блоков 0..L-1
-модели на BF16-весах, `tools/nemotron/ref_layers.py`), эталон — float64-реализация по формулам, сама сверенная с
-блоком transformers.
+Date: 2026-10-17. (Russian original: `ru/STAGE2-4_KERNELS.md`.)
 
-## Эталоны
+All tests run on real weights and real activations. The input of block L comes from running blocks 0..L-1 of the
+model on BF16 weights (`tools/nemotron/ref_layers.py`). The reference is a float64 implementation of the equations,
+itself checked against the transformers block.
 
-| Эталон | Сверен с transformers | Примечание |
+## References
+
+| reference | checked against transformers | note |
 |---|---|---|
-| `tools/nemotron/mamba_naive.py` (fp64, по токену) | = рекуррентный путь transformers; chunked fp32 путь transformers отличается на 2e-3 (до 6e-3 к 28-му токену) | chunked-путь transformers как эталон не годится |
-| `tools/nemotron/attn_naive.py` (fp64) | блок 7: 1.9e-6 (64 т.), 4.6e-7 (2048 т.) | + вариант с K/V, округлёнными до BF16 (кэш движка) |
-| `tools/nemotron/moe_naive.py` (fp64) | блок 1 на BF16: 4.0e-7 | дамп экспертов — байты NVFP4 чекпоинта в раскладке ggml |
+| `tools/nemotron/mamba_naive.py` (fp64, per token) | = transformers' recurrent path; transformers' chunked fp32 path differs by 2e-3 (up to 6e-3 by token 28) | transformers' chunked path is not usable as a reference |
+| `tools/nemotron/attn_naive.py` (fp64) | block 7: 1.9e-6 (64 tokens), 4.6e-7 (2048 tokens) | plus a variant with K/V rounded to BF16 (the engine's cache) |
+| `tools/nemotron/moe_naive.py` (fp64) | block 1 on BF16: 4.0e-7 | the experts are dumped as the checkpoint's NVFP4 bytes in ggml layout |
 
-## Ядра (библиотека `strata_nemotron_kernels`, путь qwen4exp её не линкует)
+## Kernels (library `strata_nemotron_kernels`; the qwen4exp path does not link it)
 
-| Файл | Что |
+| file | what |
 |---|---|
-| `src/kernels/cuda/mamba.cu`, `include/strata/kernels/mamba.hpp` | decode: conv+bias+SiLU, шаг SSM (варп на строку (h,p), состояние FP32 (H,P,N)), gated RMSNorm по группам 1024; prefill: conv по T токенам, скан с состоянием в регистрах, norm по строкам |
-| `src/kernels/cuda/nemo_attn.cu`, `nemo_attn.hpp` | NoPE GQA 32/2 × 128, causal, BF16 K/V-кэш, split-K + слияние; одно ядро на decode, verify-окно и prompt |
-| `src/kernels/cuda/nemo_moe.cu`, `nemo_moe.hpp` | роутер (sigmoid + bias → top-22, веса = sigmoid, нормировка, ×5), NVFP4 W4A16 GEMV (ggml block_nvfp4, scale_2 тензора), k экспертов токена одним запуском + детерминированная сумма |
+| `src/kernels/cuda/mamba.cu`, `include/strata/kernels/mamba.hpp` | decode: conv + bias + SiLU, the SSM step (a warp per (h, p) row, FP32 state (H, P, N)), gated RMSNorm over groups of 1024; prefill: conv over T tokens, a scan with the state in registers, the norm per row |
+| `src/kernels/cuda/nemo_attn.cu`, `nemo_attn.hpp` | NoPE GQA 32/2 × 128, causal, BF16 K/V cache, split-K + merge; one kernel for decode, the verify window and the prompt |
+| `src/kernels/cuda/nemo_moe.cu`, `nemo_moe.hpp` | router (sigmoid + bias → top-22, weights = sigmoid, normalized, ×5); NVFP4 W4A16 GEMV (ggml block_nvfp4, the tensor's scale_2); a token's k experts in one launch, plus a deterministic sum |
 
-Проекции (in/out_proj, q/k/v/o, роутер, латент) в тестах — существующий `bf16_gemv_fp32_mmvf` Strata (FP32
-активации, точные произведения); форматы паков (NVFP4 / Q8_0) для них — этап 5.
+In the tests, the projections (in/out_proj, q/k/v/o, router, latent) use Strata's existing `bf16_gemv_fp32_mmvf`
+(FP32 activations, exact products). Pack formats for them (NVFP4 / Q8_0) come in stage 5.
 
-## Результаты (относительная ошибка ||got − want|| / ||want||, худший токен)
+## Results (relative error ||got − want|| / ||want||, worst token)
 
-**Mamba-2, блок 0, 64 токена** (`mamba_parity`):
+**Mamba-2, block 0, 64 tokens** (`mamba_parity`):
 
-| Проверка | Ошибка |
+| check | error |
 |---|---:|
-| ядро между проекциями (y после gated norm) | 5.0e-7 |
-| финальное SSM-состояние / conv-состояние | 1.1e-7 / 0 |
-| весь миксер с BF16-проекциями | 2.3e-7 |
-| prefill двумя кусками (37 + 27) против эталона | 5.0e-7 |
-| prefill против decode тех же токенов | **побитно равно** (выход, состояние, conv) |
-| негативный тест (перевёрнутые отводы conv) | 0.81 → ловится |
+| the kernel between the projections (y after the gated norm) | 5.0e-7 |
+| final SSM state / conv state | 1.1e-7 / 0 |
+| the whole mixer with BF16 projections | 2.3e-7 |
+| prefill in two pieces (37 + 27) against the reference | 5.0e-7 |
+| prefill against decode of the same tokens | **bit-identical** (output, state, conv) |
+| negative test (conv taps reversed) | 0.81 → caught |
 
-Допуск: 2e-5 (ядро), 1e-4 (весь миксер). Prefill-скан на 8K-куске: 7.2–7.6 мс на слой, ~24K т/с за 40 слоёв для
-частей Mamba без проекций (`mamba_parity --bench`); при целевом prefill ~5K т/с это ~20% времени — chunked SSD
-(tensor cores) отложен до профиля целой модели.
+Tolerance: 2e-5 (kernel), 1e-4 (whole mixer).
 
-**Attention, блок 7** (`attn_parity`), три режима: decode по токену, prompt двумя кусками, verify-окна по 4:
+The prefill scan on an 8K piece takes 7.2–7.6 ms per layer: ~24K tok/s over 40 layers for the Mamba parts without
+projections (`mamba_parity --bench`). At the target prefill of ~5K tok/s that is ~20% of the time. So the chunked SSD
+(tensor cores) is postponed until a profile of the whole model.
 
-| | 64 токена | 2048 токенов (до 8 split-K блоков) |
+**Attention, block 7** (`attn_parity`), three modes: decode token by token, the prompt in two pieces, verify windows of 4:
+
+| | 64 tokens | 2048 tokens (up to 8 split-K blocks) |
 |---|---:|---:|
-| ядро против эталона с BF16 K/V | 5.1e-7 | 1.8e-6 |
-| весь блок (наши проекции) против точного эталона | 2.4e-3 | 1.2e-3 |
+| the kernel against the reference with BF16 K/V | 5.1e-7 | 1.8e-6 |
+| the whole block (our projections) against the exact reference | 2.4e-3 | 1.2e-3 |
 
-Разница второй строки — цена BF16 K/V-кэша (её же показывает эталон: 2.4e-3 / 1.0e-3). Допуск ядра 1e-5.
-Найдено и исправлено: размер scratch не монотонен по T (2011 запросов требуют 2 split, 2048 — 1) —
-`nemo_attn_scratch_bytes` теперь даёт максимум по всем T' ≤ T.
+The second row's difference is the cost of the BF16 K/V cache; the reference shows the same (2.4e-3 / 1.0e-3).
+Kernel tolerance: 1e-5.
 
-**MoE, блоки 1 и 5, 64 токена** (`moe_parity`, эксперты NVFP4 по указателям, как их отдаст кэш):
+Found and fixed: the scratch size is not monotonic in T. A 2011-token request needs 2 splits and a 2048-token one
+needs 1. `nemo_attn_scratch_bytes` now returns the maximum over all T' ≤ T.
 
-| | блок 1 | блок 5 |
+**MoE, blocks 1 and 5, 64 tokens** (`moe_parity`; NVFP4 experts through pointers, as the cache will hand them over):
+
+| | block 1 | block 5 |
 |---|---:|---:|
-| логиты роутера | 6.5e-8 | 5.8e-8 |
-| выбранные наборы top-22, отличающиеся от эталона | 0 из 64 | 0 из 64 |
-| веса маршрутизации | 2.2e-7 | 2.3e-7 |
-| сумма экспертов в латенте | 1.9e-6 | 3.1e-7 |
-| выход MoE (+ латентные проекции + shared) | 5.4e-7 | 2.4e-7 |
+| router logits | 6.5e-8 | 5.8e-8 |
+| top-22 sets that differ from the reference | 0 of 64 | 0 of 64 |
+| routing weights | 2.2e-7 | 2.3e-7 |
+| sum of the experts in the latent | 1.9e-6 | 3.1e-7 |
+| MoE output (+ latent projections + shared) | 5.4e-7 | 2.4e-7 |
 
-Допуск 1e-5. Ближайший к перевороту выбор 22-го/23-го эксперта в эталоне: 3.2e-5 / 5.3e-5 по скору выбора —
-это и есть порог, ниже которого любые две реализации могут выбрать разные наборы.
+Tolerance: 1e-5.
 
-Наблюдение для этапа 4/6: за 64 токена слой задействует 467 (блок 1) и 448 (блок 5) из 512 экспертов — локальность
-маршрутизации низкая, объединение промахов в verify-окне будет большим.
+In the reference, the choice between the 22nd and 23rd expert comes closest to flipping at 3.2e-5 / 5.3e-5 of the
+selection score. That is the threshold below which any two implementations can pick different sets.
 
-## Что осталось на этих этапах
+An observation for stages 4/6: over 64 tokens a layer uses 467 (block 1) and 448 (block 5) of its 512 experts.
+Routing locality is low, so the union of misses in a verify window will be large.
 
-- Новый тип кэша (SSM 160 MiB + conv на последовательность рядом с KV) — появится вместе с сессией движка
-  (композиция блоков, графы), так же как у GDN в Strata.
-- Профиль частоты экспертов (по образцу `--dump-routing` / `tools/make_profile.py`) — когда движок пройдёт модель целиком.
-- Chunked SSD для prefill — по профилю.
+## What was left for these stages
+
+- A new cache type (SSM 160 MiB + conv per sequence, next to the KV), coming with the engine's session (block
+  composition, graphs), as for GDN in Strata.
+- An expert frequency profile (after `--dump-routing` / `tools/make_profile.py`), once the engine runs the whole
+  model.
+- A chunked SSD for prefill, depending on the profile.

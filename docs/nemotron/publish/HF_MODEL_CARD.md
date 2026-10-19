@@ -27,15 +27,14 @@ weights, repacked without loss. The 1.6 GB multi-token-prediction (MTP) block is
 included.
 
 It was built for [strata-nemotron](<FORK_URL>), a Nemotron-H fork of the [Strata](https://github.com/Niko1221/Strata)
-engine. The MTP-free file also loads in llama.cpp.
+engine. llama.cpp does not load it: llama.cpp cannot read NVFP4 tensors inside the MTP block.
 
-Files are named after their lowest-bit format, NVFP4, which holds over 90% of the bytes. Each model is split in two
-with llama.cpp's `gguf-split` (Hugging Face caps a file at 50 GB). Give either engine the path of any shard:
+The file is named after its lowest-bit format, NVFP4, which holds over 90% of the bytes. It is split in two with
+llama.cpp's `gguf-split` (Hugging Face caps a file at 50 GB). Give the engine the path of either shard:
 
 | model | shards | size | MTP | runs in |
 |---|---|---:|---|---|
 | `Nemotron-3.5-Super-120B-A12B-NVFP4` | `-00001-of-00002.gguf`, `-00002-of-00002.gguf` | 71.6 GB | yes | strata-nemotron |
-| `Nemotron-3.5-Super-120B-A12B-NVFP4-noMTP` | `-00001-of-00002.gguf`, `-00002-of-00002.gguf` | 69.8 GB | no | strata-nemotron, llama.cpp |
 
 The split files hold the same tensors as the single file. strata-nemotron gives the same perplexity on both
 (3.2120 on 8 × 1024 wikitext tokens).
@@ -90,7 +89,7 @@ Prefill on a second prompt, with the expert cache warm: 16K at 12 700 tok/s, 256
 340 s. In chat (temperature 1.0), decode with MTP runs at 155–209 tok/s. Peak use: ~30 GB VRAM and ~105 GB RSS
 (the expert file is pinned in RAM). **You need 128 GB of RAM.**
 
-For comparison, on the same machine and the same weights (the MTP-free file), llama.cpp took 220 s for the 25
+For comparison, on the same machine and the same weights (an MTP-free variant), llama.cpp took 220 s for the 25
 prompts, against 19 s for strata-nemotron.
 
 ## How to run
@@ -104,8 +103,8 @@ strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf --
 
 `serve/server.py` in the fork wraps the engine in an OpenAI-compatible API.
 
-**llama.cpp**: use `Nemotron-3.5-Super-120B-A12B-NVFP4-noMTP-00001-of-00002.gguf` with the experts on the CPU (`-ot exps=CPU` or `--n-cpu-moe`).
-llama.cpp does not load NVFP4 tensors inside the MTP block, so the MTP file does not load there.
+**llama.cpp** cannot load this file (no NVFP4 inside the MTP block). `convert.py --no-mtp` makes a variant it can
+load; we used one as the reference for the checks above.
 
 ## How it was made
 
@@ -127,9 +126,8 @@ patching llama.cpp:
 
 ## Limits
 
-- Text only: the vision and video tower is not in these files. Unsloth's `mmproj-BF16.gguf` (projector `nemotron_omni`,
-  current llama.cpp) should pair with the noMTP file for images in llama.cpp; this was not tested. strata-nemotron has
-  no vision yet.
+- Text only: the vision and video tower is not in these files. For images, Unsloth's `mmproj-BF16.gguf` (projector
+  `nemotron_omni`, current llama.cpp) carries the tower; strata-nemotron has no vision yet.
 - The speed figures are from one machine. The fast prompt path (FP4 tensor cores) needs an RTX 50-series / sm_120 GPU.
 - Not tested: Windows, other GPUs, other RAM sizes, downstream benchmarks beyond the checks above.
 - The reasoning modes and the chat template are NVIDIA's (`chat_template.jinja` from the checkpoint).

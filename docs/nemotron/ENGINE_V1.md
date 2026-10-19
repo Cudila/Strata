@@ -1,53 +1,59 @@
-# strata-nemotron: движок v1 и слот llama-swap (2026-10-17)
+# strata-nemotron: engine v1 (2026-10-17)
 
-## Что работает
+(Russian original: `ru/ENGINE_V1.md`.)
 
-- `build/strata-nemotron` (`src/program/nemo_main.cpp`, `src/core/nemo_model.cpp`) — отдельный бинарь ветки, протокол
-  движка Strata (`GEN` / `T` / `DONE`, `STOP`, `QUIT`), поэтому его ведёт штатный `serve/server.py` (OpenAI/Anthropic
-  API, шаблон, reasoning, tool calls).
-- Слот `nemotron-3.5-super` в llama-swap → `serve/server.py --config strata-nemotron-mix.json` (ветка);
-  запасной `nemotron-3.5-super-llamacpp` на llama.cpp-glm5next.
-- Размещение: плотные веса в VRAM в форматах GGUF (5.0 GiB), эксперты — pinned-арена в RAM (59 GiB, старт ~30 с),
-  LRU-кэш экспертов в VRAM (~180 слотов на MoE-слой, ~21 GiB), KV BF16 на контекст, SSM-состояния FP32.
-- Переиспользование диалога: снимок состояния на границе последнего завершённого сообщения; следующий ход читает
-  только новое (замер: 3597 из 3632 токенов взяты из снимка, prompt 1.1 с вместо 23.5 с).
-- Prefill на tensor cores: плотные матрицы и эксперты — BF16-копия веса (точная для NVFP4, scale_2 → alpha) +
-  cuBLAS; Mamba и shared-эксперт подчанками по 2048 строк, эксперты группами по ≤32, их выходы сразу суммируются в
-  `routed` (без буфера `parts`). Decode и окна ≤ 15 токенов — свои CUDA-core ядра (`nemo_gemm`).
+## What works
 
-## Проверки
+- **The engine binary.** `build/strata-nemotron` (`src/program/nemo_main.cpp`, `src/core/nemo_model.cpp`) is a separate
+  binary. It speaks Strata's engine protocol (`GEN` / `T` / `DONE`, `STOP`, `QUIT`), so the regular `serve/server.py`
+  drives it: the OpenAI/Anthropic API, the chat template, reasoning, tool calls.
+- **The server config** is `serve/server.py --config <config>.json`; see `strata-nemotron.example.json`.
+- **Placement in memory:**
+  - dense weights in VRAM in their GGUF formats (5.0 GiB);
+  - experts in a pinned arena in RAM (59 GiB, ~30 s to start);
+  - an LRU expert cache in VRAM (~180 slots per MoE layer, ~21 GiB);
+  - BF16 KV for the context, FP32 SSM states.
+- **Conversation reuse.** The state is saved at the boundary of the last finished message, so the next turn reads only
+  what is new. Measured: 3597 of 3632 tokens came from the snapshot, and the prompt took 1.1 s instead of 23.5 s.
+- **Prefill on tensor cores.**
+  - Dense matrices and experts: a BF16 copy of the weight (exact for NVFP4, with scale_2 as alpha) plus cuBLAS.
+  - Mamba and the shared expert: sub-chunks of 2048 rows.
+  - Experts: groups of ≤ 32, whose outputs are summed straight into `routed` (no `parts` buffer).
+  - Decode and windows of ≤ 15 tokens: our own CUDA-core kernels (`nemo_gemm`).
 
-| Проверка | Результат |
+## Checks
+
+| check | result |
 |---|---|
-| PPL wikitext-2, 16 × 1024 (BOS в начале куска) | 3.0337 (FP32-путь) / 3.0347 (tensor cores); llama.cpp на том же GGUF 3.065 ± 0.069, точный FP8 3.016 |
-| Жадный ответ на «быструю сортировку» | дословно совпадает с llama.cpp (первые абзацы) |
-| Проверочный набор через llama-swap | plain / tool call / tool result + system посреди + high / developer — все проходят |
-| Токенизатор сервера против HF tokenizer.json | 2896 строк wikitext + проверочные строки + 2 чата: 0 расхождений |
-| `nemo_gemm_parity` (NVFP4/Q8_0/BF16/F32, M = 1..100) | ≤ 6.2e-7 от RMS против fp64; строка токена побитно не зависит от M |
+| PPL wikitext-2, 16 × 1024 (BOS at the start of each piece) | 3.0337 (FP32 path) / 3.0347 (tensor cores); llama.cpp on the same weights 3.065 ± 0.069, exact FP8 3.016 |
+| greedy answer to "quicksort" | the same text as llama.cpp, word for word (the first paragraphs) |
+| server test set | plain / tool call / tool result + system in the middle + high / developer: all pass |
+| the server's tokenizer against HF tokenizer.json | 2896 wikitext lines + test strings + 2 chats: 0 differences |
+| `nemo_gemm_parity` (NVFP4/Q8_0/BF16/F32, M = 1..100) | ≤ 6.2e-7 of RMS against fp64; a token's row is bit-identical for any M |
 
-## Найдено и исправлено по дороге (общий код)
+## Found and fixed along the way (shared code)
 
-- `serve/server.py`: `stop_ids` брал все токены строки `<|endoftext|>`; у Nemotron её нет, и её кусок `<` обрывал
-  каждый tool call на `<function=`. Теперь в стоп-набор идут только однотокенные строки (у Qwen обе однотокенные —
-  поведение swift15 то же).
-- `serve/server.py` + `tools/strata_tokenizer.py`: pre-токенайзер берётся из `tokenizer.json` пака (`pixtral`/`tekken`:
-  регулярка из tokenizer.json модели + `ignore_merges`); `qwen35` — как было.
-- `gguf_reader.hpp`: NVFP4 (40) в `block_geometry`; числовые массивы метаданных ≤ 4096 хранятся целиком; `map()`.
+- `serve/server.py`: `stop_ids` took every token of the string `<|endoftext|>`. Nemotron has no such token, and its
+  piece `<` ended every tool call at `<function=`. Now only single-token strings go into the stop set. For Qwen both
+  strings are single tokens, so swift15 behaves the same.
+- `serve/server.py` + `tools/strata_tokenizer.py`: the pre-tokenizer now comes from the pack's `tokenizer.json`. For
+  `pixtral`/`tekken` that is the regex from the model's tokenizer.json plus `ignore_merges`; `qwen35` works as before.
+- `gguf_reader.hpp`: numeric metadata arrays of ≤ 4096 items are kept whole; `map()`.
 
-## Скорость (RTX 5090, 14700KF, DDR5-5200, greedy)
+## Speed (RTX 5090, 14700KF, DDR5-5200, greedy)
 
-| | v1 (FP32 CUDA cores, chunk 2048) | сейчас (cuBLAS BF16, chunk 8192) | llama.cpp-glm5next, тот же GGUF |
+| | v1 (FP32 CUDA cores, chunk 2048) | then (cuBLAS BF16, chunk 8192) | llama.cpp, same weights |
 |---|---:|---:|---:|
-| decode, короткий промпт | 21.5 т/с | ~21 т/с | 19.2–19.6 т/с |
-| prefill 8K | 151 т/с | 1270 т/с | не мерили |
+| decode, short prompt | 21.5 tok/s | ~21 tok/s | 19.2–19.6 tok/s |
+| prefill 8K | 151 tok/s | 1270 tok/s | not measured |
 
-Профиль prefill 8K (chunk 8192, с синхронизациями): эксперты — счёт 39%, копии по PCIe 22%; Mamba 21%; attention 7%.
-Профиль decode: эксперты (промахи по PCIe при LRU, hit rate 56–60%) ~59%, Mamba 22%.
+Profile of an 8K prefill (chunk 8192, with syncs): experts' compute 39%, their PCIe copies 22%; Mamba 21%;
+attention 7%. Profile of decode: experts ~59% (PCIe misses under LRU, hit rate 56–60%), Mamba 22%.
 
-## Дальше по скорости
+## Next for speed
 
-1. Decode: CPU-лейн для промахов (часть промахнувшихся экспертов считает CPU параллельно с PCIe), профиль частот
-   вместо LRU, затем MTP (этап 6).
-2. Кванты экспертов меньше NVFP4 (этап 5): IQ3_XXS/IQ2_S + IQ4_NL/Q2_0 — ×1.7 экспертов в VRAM и вдвое меньше байт
-   на промах.
-3. Prefill: перекрыть копии экспертов со счётом (отдельный поток), FP4 tensor cores вместо BF16.
+1. Decode: a CPU lane for misses (the CPU computes part of the missed experts in parallel with PCIe); a frequency
+   profile instead of LRU; then MTP (stage 6).
+2. Expert quants smaller than NVFP4 (stage 5): IQ3_XXS/IQ2_S + IQ4_NL/Q2_0. That gives ×1.7 experts in VRAM and half
+   the bytes per miss.
+3. Prefill: overlap expert copies with compute (a separate stream); FP4 tensor cores instead of BF16.

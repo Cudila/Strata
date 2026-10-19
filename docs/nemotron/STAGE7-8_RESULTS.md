@@ -1,75 +1,115 @@
-# strata-nemotron: этапы 7–8 — сквозная проверка и замеры (2026-10-19)
+# strata-nemotron: stages 7–8 — end-to-end checks and measurements (2026-10-19)
 
-Машина: RTX 5090 32 GB (sm_120), i7-14700KF, 128 GB DDR5-5200, PCIe 5 (~45 ГБ/с host→device). Модель:
-`nemotron-super-vl-mix.gguf` (эксперты NVFP4, Mamba in/out NVFP4, attention и lm_head Q8_0, остальное BF16, MTP).
-Слот работает под `~/llm/vram-guard` (1 ГБ VRAM всегда свободен для рабочего стола), `--vram-reserve-mib 1024`.
+(Russian original: `ru/STAGE7-8_RESULTS.md`.)
 
-## Этап 7: корректность
+Machine: RTX 5090 32 GB (sm_120), i7-14700KF, 128 GB DDR5-5200, PCIe 5 (~45 GB/s host→device).
 
-**Перплексия** (wikitext-2 test, 40 чанков × 1024, вторая половина каждого чанка, prompt-путь):
+Model: `Nemotron-3.5-Super-120B-A12B-NVFP4` (experts NVFP4, Mamba in/out NVFP4, attention and lm_head Q8_0, the rest
+BF16, MTP). 1 GB of VRAM is always kept free for the desktop, and the engine runs with `--vram-reserve-mib 1024`.
 
-| путь | PPL | попарный ΔNLL к соседу |
+## Stage 7: correctness
+
+**Perplexity** (wikitext-2 test, 40 chunks × 1024, the second half of each chunk scored, prompt path):
+
+| path | PPL | pairwise ΔNLL against the row above |
 |---|---:|---|
-| llama.cpp на том же файле (референс, этап 1) | 3.065 (16 × 1024) | — |
-| Strata v1 (BF16-путь) | 3.034 (16 × 1024) | — |
-| Strata v3 до третьей волны | 4.0516 (40 × 1024) | — |
-| + W8A8 для attention и fc1/fc2 (сейчас) | 4.0533 | −0.0004 ± 0.0022 (шум) |
+| llama.cpp on the same weights (the reference, stage 1) | 3.065 (16 × 1024) | — |
+| Strata v1 (BF16 path) | 3.034 (16 × 1024) | — |
+| Strata v3 before the third wave | 4.0516 (40 × 1024) | — |
+| + W8A8 for attention and fc1/fc2 (now) | 4.0533 | −0.0004 ± 0.0022 (noise) |
 
-(4.05 и 3.03 — разные наборы чанков: 40 против 16.) Накопленная цена всех приближений prompt-пути против точного
-BF16 — около ×1.008 по PPL (W4A4 ×1.003, int8-attention ×1.004–1.005, остальное в шуме); decode-путь не хуже v2.
+4.05 and 3.03 come from different chunk sets: 40 chunks against 16.
 
-**Сравнение через API с референсом** (`tools/nemotron/api_compare.py`): 25 промптов (факты, арифметика, код, SQL, bash,
-переводы RU/EN, формулы), greedy, через llama-swap в слот Strata и в слот llama.cpp на тех же весах (llama.cpp — `mix-nomtp`, он не грузит NVFP4 в MTP):
+The accumulated cost of every approximation on the prompt path, against exact BF16, is about ×1.008 PPL:
+- W4A4: ×1.003;
+- int8 attention: ×1.004–1.005;
+- everything else within noise.
 
-| | правильных | время (с загрузкой) |
+The decode path is no worse than v2.
+
+**Comparison with the reference through the API** (`tools/nemotron/api_compare.py`):
+- 25 prompts: facts, arithmetic, code, SQL, bash, RU/EN translation, formulas;
+- greedy, through the OpenAI API, to a Strata server and to a llama.cpp server on the same weights;
+- llama.cpp used `-noMTP`, because it does not load NVFP4 inside the MTP block.
+
+| | correct | time (including load) |
 |---|---:|---:|
-| Strata (`nemotron-3.5-super`) | 25 / 25 | 19 с |
-| llama.cpp (`nemotron-3.5-super-llamacpp`) | 25 / 25 | 220 с |
+| strata-nemotron | 25 / 25 | 19 s |
+| llama.cpp | 25 / 25 | 220 s |
 
-Ответы побитно одинаковы в 21 из 25; в остальных четырёх расходятся после общего начала в 3–101 символ (другая
-арифметика ядер: при близких логитах greedy выбирает другой токен), смысл ответа тот же.
+The answers are byte-identical in 21 of 25. In the other four they share a beginning of 3–101 characters and then
+diverge. The kernels' arithmetic differs, so with close logits greedy picks another token. The meaning of the answers
+is the same.
 
-**Greedy на длинном контексте** — «иголка в стоге сена» через llama-swap (`tools/needle_bench.py`, глубины 10/50/90%):
-32K, 128K, 256K, 512K, 1M (1 027 882 токена) — 15/15; после второй волны 32K и 256K — 6/6; после третьей волны 256K и 1M
-(1 029 587 токенов) — 6/6, 1M за 340 с (было 374). Greedy со спекуляцией побитно = обычный decode (300/300).
+**Greedy on long context**: needle in a haystack through the server (`tools/needle_bench.py`, depths 10/50/90%).
 
-**swift15 не затронут** (общие файлы: `gguf_reader.hpp`, `serve/server.py`, `tools/strata_tokenizer.py`; CMake —
-только новые библиотеки): прод-движок `~/llm/strata/engine/strata` против сборки ветки `build/strata` на конфиге
-swift15, 3000 токенов промпта — логиты после prompt-пути (`STRATA_DUMP_FIRST_LOGITS`) побитно одинаковы, 128 greedy
-токенов одинаковы, скорость в шуме (decode 193 / 192 т/с, prefill 4087 / 3998 т/с, в другом прогоне наоборот);
-токенизатор: 20 текстов (с и без спецтокенов, tool call, Unicode, код) — id одинаковы; стоп-токены сервера те же.
+| when | lengths | found |
+|---|---|---:|
+| after v3 | 32K, 128K, 256K, 512K, 1M (1 027 882 tokens) | 15/15 |
+| after the second wave | 32K, 256K | 6/6 |
+| after the third wave | 256K, 1M (1 029 587 tokens) | 6/6 |
 
-## Этап 8: замеры
+1M takes 340 s now (it was 374). Speculative greedy is bit-identical to plain decode (300/300).
 
-`tools/nemotron/stage8_bench.py`: тот же wikitext-2 (у каждой модели своя токенизация), промпт первых N токенов, затем 256 greedy-токенов;
-один процесс на строку (кэш экспертов холодный в начале промпта). VRAM — пик `nvidia-smi` по карте (вместе с рабочим
-столом, ~1 ГБ); RSS — пик процесса, у Nemotron в нём закреплённый в RAM файл с экспертами (~63 ГБ) и кэш страниц.
+**swift15 is not affected.**
+- The shared files are `gguf_reader.hpp`, `serve/server.py` and `tools/strata_tokenizer.py`. CMake only adds new
+  libraries.
+- The test: the production engine against this branch's `build/strata`, on the swift15 config, with a 3000-token
+  prompt.
+- The logits after the prompt path (`STRATA_DUMP_FIRST_LOGITS`) are bit-identical, and so are 128 greedy tokens.
+- Speed is within noise: decode 193 / 192 tok/s, prefill 4087 / 3998 tok/s (the other way round in another run).
+- Tokenizer: 20 texts (with and without special tokens, a tool call, Unicode, code) give identical ids. The server's
+  stop tokens are the same.
 
-| модель | контекст | MTP | prefill, т/с | decode, т/с | токенов за окно | VRAM пик, МиБ | RSS пик, МиБ |
+## Stage 8: measurements
+
+`tools/nemotron/stage8_bench.py`. Setup:
+- the same wikitext-2, each model with its own tokenization;
+- a prompt of the first N tokens, then 256 greedy tokens;
+- one process per row, so the expert cache is cold at the start of the prompt;
+- VRAM is the card's `nvidia-smi` peak, including the desktop (~1 GB);
+- RSS is the process peak. For Nemotron it includes the experts page-locked in RAM (~63 GB) and the page cache.
+
+| model | context | MTP | prefill, tok/s | decode, tok/s | tokens a window | VRAM peak, MiB | RSS peak, MiB |
 |---|---:|---|---:|---:|---:|---:|---:|
-| Nemotron | 4K | да (5) | 2277 | 118 | 1.94 | 30159 | 104680 |
-| Nemotron | 4K | нет | 2447 | 96 | — | 30159 | 104999 |
-| Nemotron | 32K | да (5) | 9575 | 186 | 3.06 | 30159 | 105313 |
-| Nemotron | 32K | нет | 9521 | 109 | — | 30159 | 105255 |
-| Nemotron | 128K | да (5) | 9132 | 165 | 2.99 | 30159 | 105264 |
-| Nemotron | 128K | нет | 9059 | 95 | — | 30155 | 105426 |
-| swift15 | 4K | да (4) | 3311 | 117 | 1.74 | 30915 | 46985 |
-| swift15 | 32K | да (4) | 6457 | 128 | 1.61 | 30919 | 47125 |
-| swift15 | 128K | да (4) | 6623 | 173 | 2.53 | 30919 | 47130 |
+| Nemotron | 4K | yes (5) | 2277 | 118 | 1.94 | 30159 | 104680 |
+| Nemotron | 4K | no | 2447 | 96 | — | 30159 | 104999 |
+| Nemotron | 32K | yes (5) | 9575 | 186 | 3.06 | 30159 | 105313 |
+| Nemotron | 32K | no | 9521 | 109 | — | 30159 | 105255 |
+| Nemotron | 128K | yes (5) | 9132 | 165 | 2.99 | 30159 | 105264 |
+| Nemotron | 128K | no | 9059 | 95 | — | 30155 | 105426 |
+| swift15 | 4K | yes (4) | 3311 | 117 | 1.74 | 30915 | 46985 |
+| swift15 | 32K | yes (4) | 6457 | 128 | 1.61 | 30919 | 47125 |
+| swift15 | 128K | yes (4) | 6623 | 173 | 2.53 | 30919 | 47130 |
 
-swift15 без MTP не запускается: native-пак требует `--spec ≥ 2`. Decode на wikitext greedy; в чате (temp 1.0)
-Nemotron со спекуляцией 155–163 т/с, через слот 177–209. Prefill с тёплым кэшем (второй промпт подряд): 128 токенов
-98 мс, 2K 0.77 с (2650 т/с), 8K 1.0 с (8000), 16K 1.29 с (12 700), 64K 5.8 с (11 270), 256K 35 с (7 440), 1M через слот 340 с (~3030 т/с).
+swift15 does not run without MTP: its native pack requires `--spec ≥ 2`.
 
-Короткий промпт (до ~8K) у Nemotron медленнее, чем у swift15: top-22 из 512 экспертов задевает почти все эксперты
-каждого слоя, и время задают ~40 ГБ копий по PCIe (OPTIMIZATION_NOTES.md, п. 2.2). Начиная с 32K Nemotron быстрее
-на prefill в 1.4–1.5 раза, decode со спекуляцией сравним или выше.
+Decode in the table is greedy on wikitext. In chat (temperature 1.0), Nemotron with speculation runs at 155–163 tok/s,
+and 177–209 through the server.
 
-## Что не перенеслось или не сделано
+Prefill with the cache warm (the second prompt in a row):
 
-- Vision и видео (по таске — позже), аблитерация (не делается), стриминг KV из RAM для 1M (у Nemotron плотная
-  attention: ~0.2 с на токен; вместо него KV в VRAM страницами за счёт кэша экспертов).
-- Strata-оптимизации, не применимые к этой архитектуре: QSA-индексатор и разреженная attention (у Nemotron её нет),
-  PLE, GDN. CPU-доля экспертов на prefill (у swift15 она есть для чанков < 1024) не переносилась и не замерялась.
-- Prompt-путь не побитно равен decode-пути (W4A4, int8-attention, SSD); равенство держится внутри decode (спекуляция =
-  обычный decode).
+| prompt | time | tok/s |
+|---|---:|---:|
+| 128 tokens | 98 ms | — |
+| 2K | 0.77 s | 2650 |
+| 8K | 1.0 s | 8000 |
+| 16K | 1.29 s | 12 700 |
+| 64K | 5.8 s | 11 270 |
+| 256K | 35 s | 7 440 |
+| 1M, through the server | 340 s | ~3030 |
+
+Up to ~8K, Nemotron's prompt is slower than swift15's. Top-22 of 512 experts touches almost all experts of every
+layer, so the time is set by ~40 GB of copies over PCIe (OPTIMIZATION_NOTES.md, 2.2). From 32K on, Nemotron is
+1.4–1.5× faster in prefill, and its decode with speculation is the same or higher.
+
+## Not ported or not done
+
+- Vision and video (later, per the task).
+- Streaming the KV from RAM for 1M. Nemotron's attention is full, so that would cost ~0.2 s per token. Instead, the
+  KV lives in VRAM in pages, taking space from the expert cache.
+- Strata optimizations that do not apply to this architecture: the QSA indexer and sparse attention (Nemotron has
+  neither), PLE, GDN.
+- The CPU share of experts on prefill (swift15 has it for chunks < 1024): not ported and not measured.
+- The prompt path is not bit-identical to the decode path (W4A4, int8 attention, SSD). Bit identity holds within
+  decode: speculation equals plain decode.
