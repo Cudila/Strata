@@ -29,7 +29,8 @@ desktop. Greedy, 256 generated tokens on wikitext-2:
 *All 363 requests the v3 engine served through llama-swap (everyday chat plus tool-call, image and needle tests up to 1M): generation
 181 · 229 · 247 t/s (p50 · p95 · p99), prompt 1,257 t/s at p50 and 9,169 at p95.*
 
-- With the expert cache warm: 16K prefills at 12 700 tok/s and 256K at 7 440 tok/s. A 1M-token prompt takes 340 s.
+- Through the server (the histogram), the fastest prompts run at 11 397 tok/s (15.6K tokens) and 10 499 tok/s (62K);
+  a 1M-token prompt takes 340 s. The engine alone, with the expert cache warm, is ~10% faster: 12 700 tok/s at 16K.
 - Needle-in-a-haystack at 32K–1M: 15/15 found.
 - In chat (temperature 1.0), decode with MTP runs at 155–209 tok/s.
 

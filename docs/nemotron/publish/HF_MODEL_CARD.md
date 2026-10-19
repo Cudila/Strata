@@ -77,11 +77,14 @@ hardware* (everyday chat plus the checks in this card: tool calls, images, the 5
 for. Generation is 181 · 229 · 247 t/s (p50 · p95 · p99) and never below 106 t/s; prompt is 1,257 t/s at p50, because
 most requests are short follow-ups whose prompt is a few hundred tokens, and 9,169 t/s at p95.
 
-With the cache warm (the second prompt in a row), prefill runs at:
-- 16K: 12,700 t/s;
-- 64K: 11,270 t/s;
-- 256K: 7,440 t/s;
-- 1M tokens: 340 s.
+The fastest prompts in the histogram, through the server:
+- 15.6K tokens: 11,397 t/s;
+- 62K tokens: 10,499 t/s;
+- 1M tokens: ~3,050 t/s (340 s).
+
+The engine alone (`--bench`, the second prompt in a row, so the expert cache is warm) is ~10% faster: 12,700 t/s at 16K,
+11,270 at 64K, 7,440 at 256K. Through the server, a prompt is read in two parts: up to the last complete message,
+where the state is saved for the next turn, and then the rest. The cache is also not always warm there.
 
 Needle in a haystack at 32K, 128K, 256K, 512K and 1M (depths 10/50/90%) found 15/15.
 
