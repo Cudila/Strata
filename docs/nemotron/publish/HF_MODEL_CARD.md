@@ -223,6 +223,9 @@ Notes that cost time if you miss them:
 * **The KV grows into the expert cache.** Up to `--kv-base` (64K) it is fixed. Beyond that, each 64K page takes
   4 slots of every layer from the cache: 140 slots at 64K, 128 at 256K, 84 at 1M. They are given back on the next
   conversation.
+* **Other MTP heads are not faster.** `--mtp-gguf` loads ggml-org's separate `mtp-*.gguf` (BF16 / Q8_0 / Q4_0) instead
+  of the file's own NVFP4 block. Their draft acceptance is the same within ±3% (2.14–2.20 tokens a window at 4K, greedy,
+  identical main output), and the BF16 / Q8_0 ones take 32 / 8 expert slots a layer.
 * **llama.cpp does not load this file.** It has no NVFP4 inside the MTP block. `tools/nemotron/convert.py --no-mtp`
   in the fork makes a variant it can load.
 
