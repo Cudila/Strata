@@ -124,8 +124,8 @@ Emulated on the 5090 at 15,800 MiB (40 expert slots a layer):
 
 | | 4K | 32K | 128K | 256K |
 |---|---:|---:|---:|---:|
-| prefill, tok/s | — | 4 625 | — | — |
-| decode with MTP, tok/s | 78 | 74 | 64 | 74 |
+| prefill, tok/s | 2 378 | 4 626 | 4 422 | 3 911 |
+| decode with MTP, tok/s | 61 | 73 | 93 | 58 |
 
 The decode PPL is ×1.010 against no skipping. The fast mode costs ×1.17 here, because with few slots most misses are
 skipped. 64 GB of RAM still needs the SSD tier (ROADMAP item 3).

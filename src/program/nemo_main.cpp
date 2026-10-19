@@ -659,8 +659,8 @@ int main(int argc, char** argv) {
     {
         // a card (or --vram-limit-mib) under 20 GiB: the small-card profile, unless set by hand - an 8192-row chunk
         // and a ring of 48 expert blobs for the prompt (~140 MiB; 384: ~1.1 GiB).  At 15,800 MiB with MTP that leaves
-        // 40 expert slots a layer: prefill 4,600 tok/s at 32K (2,000 with a 2048-row chunk and 48 slots), decode the
-        // same.  Use the precise decode (--prefetch 1): with few slots the fast one costs PPL x1.17
+        // 40 expert slots a layer: prefill 4,600 tok/s at 32K (2,000 with a 2048-row chunk and 48 slots), decode
+        // 61-93 tok/s with MTP.  Use the precise decode (--prefetch 1): with few slots the fast one costs PPL x1.17
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
         const int64_t card = o.vram_limit_mib > 0 ? o.vram_limit_mib : (int64_t) (tot >> 20);
