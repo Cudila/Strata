@@ -19,6 +19,9 @@ desktop. Greedy, 256 generated tokens on wikitext-2:
 | 4K | 2 277 | 118 | 96 |
 | 32K | 9 575 | 186 | 109 |
 | 128K | 9 132 | 165 | 95 |
+| 256K | 7 336 | 138 | 79 |
+| 512K | 5 075 | 107 | 65 |
+| 1M | 3 125 (335 s) | 111 | 47 |
 
 - With the expert cache warm: 16K prefills at 12 700 tok/s and 256K at 7 440 tok/s. A 1M-token prompt takes 340 s.
 - Needle-in-a-haystack at 32K–1M: 15/15 found.

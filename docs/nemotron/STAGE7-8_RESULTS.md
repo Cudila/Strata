@@ -78,9 +78,18 @@ is the same.
 | Nemotron | 32K | no | 9521 | 109 | — | 30159 | 105255 |
 | Nemotron | 128K | yes (5) | 9132 | 165 | 2.99 | 30159 | 105264 |
 | Nemotron | 128K | no | 9059 | 95 | — | 30155 | 105426 |
+| Nemotron | 256K | yes (5) | 7336 | 138 | 2.99 | 30143 | 102840 |
+| Nemotron | 256K | no | 7301 | 79 | — | 30143 | 103384 |
+| Nemotron | 512K | yes (5) | 5075 | 107 | 2.35 | 30143 | 103116 |
+| Nemotron | 512K | no | 5013 | 65 | — | 30155 | 102989 |
+| Nemotron | 1M (1 047 552) | yes (5) | 3125 | 111 | 3.84 | 30151 | 102787 |
+| Nemotron | 1M (1 047 552) | no | 3124 | 47 | — | 30151 | 100082 |
 | swift15 | 4K | yes (4) | 3311 | 117 | 1.74 | 30915 | 46985 |
 | swift15 | 32K | yes (4) | 6457 | 128 | 1.61 | 30919 | 47125 |
 | swift15 | 128K | yes (4) | 6623 | 173 | 2.53 | 30919 | 47130 |
+
+The 256K–1M rows (added 2026-10-19) run on wikitext-2 test + train (2.87M tokens) with the rebased build;
+"1M" is the window minus 1K. At 1M the K/V has taken 56 slots a layer from the expert cache.
 
 swift15 does not run without MTP: its native pack requires `--spec ≥ 2`.
 

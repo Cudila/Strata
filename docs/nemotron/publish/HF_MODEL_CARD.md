@@ -45,17 +45,23 @@ in this file (see the note above).
 | **Decode, 4K prompt** | **118 t/s** | 96 t/s | 19.4 t/s |
 | **Decode, 32K prompt** | **186 t/s** | 109 t/s | — |
 | **Decode, 128K prompt** | **165 t/s** | 95 t/s | — |
+| **Decode, 256K prompt** | 138 t/s | 79 t/s | — |
+| **Decode, 512K prompt** | 107 t/s | 65 t/s | — |
+| **Decode, 1M prompt** | **111 t/s** | 47 t/s | — |
 | **Prefill, 4K** | 2,277 t/s | 2,447 t/s | ~30–40 t/s (short prompts) |
 | **Prefill, 32K** | **9,575 t/s** | 9,521 t/s | — |
 | **Prefill, 128K** | 9,132 t/s | 9,059 t/s | — |
+| **Prefill, 256K** | 7,336 t/s | 7,301 t/s | — |
+| **Prefill, 512K** | 5,075 t/s | 5,013 t/s | — |
+| **Prefill, 1M** | 3,125 t/s (335 s) | 3,124 t/s | — |
 | **25 test prompts, end to end** | **19 s** | — | 220 s |
 | **Context** | 1,048,576 | 1,048,576 | — |
 
 \* llama.cpp cannot load NVFP4 inside the MTP block, so it ran an MTP-free variant of this file
 (`convert.py --no-mtp`) with `--fit on`.
 
-Greedy, 256 generated tokens on wikitext-2, one process per row, so the expert cache starts cold. MTP is 5 drafts with
-a 0.8 probability cut-off, and the "tokens a window" figures are 1.94 / 3.06 / 2.99 at 4K / 32K / 128K. In chat
+Greedy, 256 generated tokens on wikitext-2 (test + train for the 256K–1M rows; "1M" is 1,047,552 prompt tokens, the window minus 1K), one process per row, so the expert cache starts cold. At 1M the K/V (~6.5 GiB) has taken 56 slots a layer from the expert cache, which is why MTP matters most there: 2.3× decode. MTP is 5 drafts with
+a 0.8 probability cut-off, and the "tokens a window" figures are 1.94 / 3.06 / 2.99 / 2.99 / 2.35 / 3.84 at 4K / 32K / 128K / 256K / 512K / 1M. In chat
 (temperature 1.0) decode with MTP runs at 155–209 t/s.
 
 With the cache warm (the second prompt in a row), prefill runs at:
