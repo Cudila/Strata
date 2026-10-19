@@ -268,6 +268,14 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(strata_nemotron PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_nemotron PUBLIC strata_artifact)
   add_executable(strata-nemotron-check src/core/nemotron_check_main.cpp)
+  if(STRATA_ENABLE_CUDA)
+    # the engine process for Nemotron-H GGUFs (src/program/nemo_main.cpp): its own binary, nothing of the qwen4exp
+    # engine links it
+    add_executable(strata-nemotron src/program/nemo_main.cpp src/core/nemo_model.cpp)
+    target_include_directories(strata-nemotron PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(strata-nemotron PRIVATE strata_nemotron strata_nemotron_kernels ${_strata_gpu_runtime_target}
+                          Threads::Threads)
+  endif()
   target_link_libraries(strata-nemotron-check PRIVATE strata_nemotron)
   set(STRATA_NEMOTRON_GGUF "" CACHE FILEPATH "a Nemotron-H GGUF for the strata-nemotron load test")
   if(STRATA_NEMOTRON_GGUF)

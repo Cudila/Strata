@@ -1,0 +1,603 @@
+// src/program/nemo_main.cpp - strata-nemotron: the engine process for Nemotron-H GGUFs (strata-nemotron).
+//
+// Two modes:
+//
+//   --ppl IDS     perplexity over a token file (whitespace-separated ids), llama-perplexity's way: chunks of --ctx
+//                 tokens, the first replaced by BOS, the second half of each chunk scored.  The same numbers as
+//                 `llama-perplexity -c <ctx>` on the same ids are the engine's whole-model check.  --ppl-decode
+//                 feeds the scored half token by token (the decode path: expert cache, tail skip); --ll-dump FILE
+//                 writes each scored token's log-probability.
+//   --serve       Strata's engine wire contract, so serve/server.py drives it like the qwen4exp engine:
+//                 stdout  INFO k=v ... ; READY <context> stop ; per request T <id> ... DONE <generated> <prompt>
+//                         <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused> ; ERR <message>
+//                 stdin   GEN <max_new> [key=value ...] <id,id,...>  (temperature, top_p, top_k, min_p, seed;
+//                         other keys are accepted and ignored); STOP (the running request ends at its next token);
+//                         WRAP (the same, for the server's shutdown); QUIT
+//
+// Conversation reuse: after a prompt is read its state is set aside; a request whose prompt starts with that prompt
+// continues from there and reads only the rest (Mamba's state cannot be rolled back, so this is the one reuse there
+// is: exactly "the previous prompt, then more").
+//
+// Usage: strata-nemotron --gguf FILE [--experts-gguf FILE] [--max-context N] [--chunk N] [--vram-reserve-mib N] [--expert-slots N]
+//                        [--kv-base N] [--spec N] [--tail-skip R] [--prefetch 0|1] [--prefetch-rank R]
+//                        (--serve | --ppl IDS [--ctx 1024] [--chunks 16] | --bench IDS [--ctx N] [--gen N] [--temp T])
+#include "strata/core/nemo_model.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+struct Sampling {
+    float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+    int top_k = 0;
+    uint64_t seed = 0;
+};
+
+/// Greedy at temperature <= 0; otherwise temperature, then top-k, top-p and min-p over the softmax, then a draw.
+int32_t sample(const float* logits, int64_t n, const Sampling& s, std::mt19937_64& rng) {
+    if (s.temperature <= 0.0f) return (int32_t) (std::max_element(logits, logits + n) - logits);
+    std::vector<int32_t> idx((size_t) n);
+    std::iota(idx.begin(), idx.end(), 0);
+    const int k = s.top_k > 0 && s.top_k < n ? s.top_k : (int) std::min<int64_t>(n, 1024);
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+    idx.resize((size_t) k);
+    std::vector<double> p((size_t) k);
+    const double mx = logits[idx[0]];
+    double sum = 0;
+    for (int i = 0; i < k; ++i) sum += (p[(size_t) i] = std::exp((logits[idx[(size_t) i]] - mx) / s.temperature));
+    int keep = k;
+    double cum = 0;
+    for (int i = 0; i < k; ++i) {
+        p[(size_t) i] /= sum;
+        if (s.min_p > 0 && p[(size_t) i] < s.min_p * p[0]) { keep = i; break; }
+        cum += p[(size_t) i];
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max(keep, 1);
+    double tot = 0;
+    for (int i = 0; i < keep; ++i) tot += p[(size_t) i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (int i = 0; i < keep; ++i) {
+        r -= p[(size_t) i];
+        if (r <= 0) return idx[(size_t) i];
+    }
+    return idx[(size_t) keep - 1];
+}
+
+bool parse_ids(const std::string& s, std::vector<int32_t>& out) {
+    out.clear();
+    const char* p = s.c_str();
+    while (*p) {
+        char* end = nullptr;
+        const long v = std::strtol(p, &end, 10);
+        if (end == p) return false;
+        out.push_back((int32_t) v);
+        p = end;
+        if (*p == ',') ++p;
+        else if (*p) return false;
+    }
+    return !out.empty();
+}
+
+int run_ppl(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t chunks, bool bos_first, bool decode,
+            const char* dump) {
+    std::vector<int32_t> ids;
+    {
+        FILE* f = std::fopen(path, "rb");
+        if (!f) { std::fprintf(stderr, "cannot open %s\n", path); return 1; }
+        long v;
+        while (std::fscanf(f, "%ld", &v) == 1) ids.push_back((int32_t) v);
+        std::fclose(f);
+    }
+    const int64_t n_vocab = m.geometry().n_vocab;
+    const int64_t have = (int64_t) ids.size() / ctx;
+    if (chunks <= 0 || chunks > have) chunks = have;
+    std::vector<float> lg((size_t) (ctx * n_vocab));
+    double nll = 0;
+    int64_t scored = 0;
+    const int32_t bos = 1;
+    FILE* df = dump ? std::fopen(dump, "w") : nullptr;
+    const auto t0 = Clock::now();
+    for (int64_t c = 0; c < chunks; ++c) {
+        std::vector<int32_t> tok(ids.begin() + c * ctx, ids.begin() + (c + 1) * ctx);
+        if (bos_first) tok[0] = bos;
+        m.reset();
+        std::string err;
+        if (decode) {
+            // the first half as a prompt, then the scored half token by token through the decode path
+            const int64_t h = ctx / 2;
+            if (!m.forward(tok.data(), h, lg.data() + (h - 1) * n_vocab, err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+            for (int64_t t = h; t < ctx - 1; ++t)
+                if (!m.forward(tok.data() + t, 1, lg.data() + t * n_vocab, err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+        } else if (!m.forward_all(tok.data(), ctx, lg.data(), err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+        for (int64_t t = ctx / 2; t < ctx - 1; ++t) {
+            const float* l = lg.data() + t * n_vocab;
+            const float mx = *std::max_element(l, l + n_vocab);
+            double s = 0;
+            for (int64_t i = 0; i < n_vocab; ++i) s += std::exp((double) l[i] - mx);
+            const double ll = (double) l[tok[(size_t) t + 1]] - mx - std::log(s);
+            nll -= ll;
+            ++scored;
+            if (df) std::fprintf(df, "%.6f\n", ll);
+        }
+        std::printf("[%lld] %.4f\n", (long long) c + 1, std::exp(nll / (double) scored));
+        std::fflush(stdout);
+    }
+    std::printf("Final estimate: PPL = %.4f over %lld scored tokens (%lld chunks of %lld), %.1f s\n",
+                std::exp(nll / (double) scored), (long long) scored, (long long) chunks, (long long) ctx,
+                ms_since(t0) / 1000.0);
+    if (df) std::fclose(df);
+    const auto st = m.stats();
+    if (decode)
+        std::printf("expert hits %llu, misses %llu, skipped %llu\n", (unsigned long long) st.expert_hits,
+                    (unsigned long long) st.expert_misses, (unsigned long long) st.expert_skips);
+    return 0;
+}
+
+int g_spec = 0;   ///< --spec N: drafts a window (serve), 0 = no speculation
+
+int run_serve(strata::core::NemoModel& m) {
+    std::signal(SIGPIPE, SIG_IGN);
+    const int64_t n_vocab = m.geometry().n_vocab;
+    const auto st = m.stats();
+    std::printf("INFO engine=strata-nemotron-v1 engine_kind=nemotron context=%lld kv=bf16 expert_slots=%lld "
+                "expert_cache_mib=%lld experts=%lld pinned=%d logit_bias=0\n",
+                (long long) m.max_context(), (long long) (st.slots_per_layer * m.geometry().count(strata::core::NemotronBlock::Moe)),
+                (long long) (st.expert_cache_gib * 1024), (long long) (m.geometry().n_expert * m.geometry().count(strata::core::NemotronBlock::Moe)),
+                st.pinned ? 1 : 0);
+    std::printf("READY %lld stop\n", (long long) m.max_context());
+    std::fflush(stdout);
+
+    std::atomic<bool> stop_req{false}, quit_req{false};
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::thread([&] {
+        std::string buf, l;
+        char chunk[65536];
+        for (;;) {
+            const size_t nl = buf.find('\n');
+            if (nl != std::string::npos) {
+                l.assign(buf, 0, nl);
+                buf.erase(0, nl + 1);
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                if (l == "STOP" || l.rfind("STOP ", 0) == 0 || l == "WRAP" || l.rfind("PAUSE", 0) == 0) {
+                    stop_req.store(true);
+                    continue;
+                }
+                if (l == "QUIT") { quit_req.store(true); stop_req.store(true); }
+                std::lock_guard<std::mutex> lk(mu);
+                lines.push_back(l);
+                cv.notify_one();
+                continue;
+            }
+            const ssize_t n = ::read(0, chunk, sizeof chunk);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            buf.append(chunk, (size_t) n);
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        eof = true;
+        cv.notify_one();
+    }).detach();
+
+    const std::vector<int32_t> eos = {2, 11};   // </s>, <|im_end|> (generation_config.json)
+    std::vector<int32_t> snap_prompt;           // the prompt the model's snapshot is the end of
+    std::vector<float> logits((size_t) n_vocab);
+    for (;;) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return !lines.empty() || eof; });
+            if (lines.empty()) break;
+            line = std::move(lines.front());
+            lines.pop_front();
+        }
+        if (line == "QUIT") break;
+        std::istringstream ss(line);
+        std::string cmd;
+        ss >> cmd;
+        if (cmd != "GEN") {
+            if (!cmd.empty()) std::printf("ERR unknown command %s\n", cmd.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        stop_req.store(false);
+        long long max_new = 0;
+        ss >> max_new;
+        Sampling sp;
+        std::string tok, ids_s;
+        bool sampled = false;
+        while (ss >> tok) {
+            const size_t eq = tok.find('=');
+            if (eq == std::string::npos) { ids_s = tok; continue; }
+            const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+            if (k == "temperature") { sp.temperature = (float) std::atof(v.c_str()); sampled = sp.temperature > 0; }
+            else if (k == "top_p") sp.top_p = (float) std::atof(v.c_str());
+            else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
+            else if (k == "min_p") sp.min_p = (float) std::atof(v.c_str());
+            else if (k == "seed") sp.seed = (uint64_t) std::atoll(v.c_str());
+        }
+        if (!sampled) sp.temperature = 0.0f;
+        std::vector<int32_t> prompt;
+        if (max_new <= 0 || !parse_ids(ids_s, prompt)) {
+            std::printf("ERR malformed GEN line\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (const char* dump = std::getenv("STRATA_NEMO_DUMP_PROMPT")) {   // debugging: the ids the server rendered
+            if (FILE* f = std::fopen(dump, "ab")) {
+                for (size_t i = 0; i < prompt.size(); ++i) std::fprintf(f, i ? ",%d" : "%d", prompt[i]);
+                std::fprintf(f, "\n");
+                std::fclose(f);
+            }
+        }
+        std::mt19937_64 rng(sp.seed ? sp.seed : (uint64_t) Clock::now().time_since_epoch().count());
+        std::string err;
+        const auto t0 = Clock::now();
+        // reuse: the previous prompt is a prefix of this one
+        size_t reused = 0;
+        const bool cont = !snap_prompt.empty() && m.snapshot_pos() == (int64_t) snap_prompt.size() &&
+                          snap_prompt.size() <= prompt.size() &&
+                          std::equal(snap_prompt.begin(), snap_prompt.end(), prompt.begin());
+        // the snapshot goes at the end of the prompt's last COMPLETE message (after its <|im_end|> and newline), not at
+        // the prompt's end: the next turn re-renders this turn's generation prompt (<|im_start|>assistant\n<think>\n)
+        // as the answer it became, so only the messages before it are a prefix the next prompt will share
+        int64_t boundary = (int64_t) prompt.size();
+        for (int64_t i = (int64_t) prompt.size() - 1; i >= 0; --i)
+            if (prompt[(size_t) i] == 11) {   // <|im_end|>
+                boundary = i + 1 + ((size_t) i + 1 < prompt.size() && prompt[(size_t) i + 1] == 1010 ? 1 : 0);   // + "\n"
+                break;
+            }
+        bool ok = true;
+        int64_t at = 0;
+        if (cont && m.restore()) {
+            reused = snap_prompt.size();
+            at = (int64_t) reused;
+        } else {
+            m.reset();
+        }
+        const auto feed = [&](int64_t upto) {   // the prompt from `at` to `upto`
+            if (ok && upto > at) {
+                ok = m.forward(prompt.data() + at, upto - at, logits.data(), err);
+                at = upto;
+            }
+        };
+        if (boundary > at) {
+            feed(boundary);
+            if (ok) {
+                m.snapshot();
+                snap_prompt.assign(prompt.begin(), prompt.begin() + boundary);
+            }
+        }
+        feed((int64_t) prompt.size());
+        if (ok && at == (int64_t) reused && reused == prompt.size()) logits = m.snapshot_logits();
+        if (!ok) {
+            snap_prompt.clear();
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        const double prompt_ms = ms_since(t0);
+        std::printf("REUSED %zu\n", reused);
+        const auto t1 = Clock::now();
+        const auto sp0 = m.stats();
+        const uint64_t spec_w0 = sp0.spec_windows, spec_a0 = sp0.spec_accepted, spec_d0 = sp0.spec_drafted;
+        long long produced = 0;
+        const char* finish = "length";
+        if (g_spec > 0 && m.has_mtp()) {
+            // speculation: the first token from the prompt's logits, then windows of MTP drafts verified at once
+            const std::function<int32_t(const float*)> pick = [&](const float* lg) { return sample(lg, n_vocab, sp, rng); };
+            int32_t id = sample(logits.data(), n_vocab, sp, rng);
+            std::vector<int32_t> got;
+            for (;;) {
+                std::printf("T %d\n", id);
+                std::fflush(stdout);
+                ++produced;
+                if (std::find(eos.begin(), eos.end(), id) != eos.end()) { finish = "stop"; break; }
+                if (produced >= max_new) break;
+                if (got.empty()) {
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    if (m.pos() + 1 > m.max_context()) { finish = "length"; break; }
+                    const int nd = (int) std::min<int64_t>(g_spec, m.max_context() - m.pos() - 1);
+                    if (!m.spec_step(id, nd, got, err, sp.temperature > 0 ? &pick : nullptr)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        ok = false;
+                        break;
+                    }
+                    std::reverse(got.begin(), got.end());
+                }
+                id = got.back();
+                got.pop_back();
+            }
+        }
+        while (ok && produced < max_new && !(g_spec > 0 && m.has_mtp())) {
+            if (stop_req.load()) { finish = "cancel"; break; }
+            const int32_t id = sample(logits.data(), n_vocab, sp, rng);
+            std::printf("T %d\n", id);
+            std::fflush(stdout);
+            ++produced;
+            if (std::find(eos.begin(), eos.end(), id) != eos.end()) { finish = "stop"; break; }
+            if (produced >= max_new) break;
+            if (m.pos() + 1 > m.max_context()) { finish = "length"; break; }
+            if (!m.forward(&id, 1, logits.data(), err)) {
+                std::printf("ERR %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) { std::fflush(stdout); continue; }
+        const double decode_ms = ms_since(t1);
+        const auto s2 = m.stats();
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu %llu %llu\n", produced, prompt.size(), prompt_ms, decode_ms,
+                    finish, reused, (unsigned long long) s2.expert_hits,
+                    (unsigned long long) (s2.expert_hits + s2.expert_misses));
+        std::fflush(stdout);
+        if (s2.spec_windows > spec_w0)
+            std::fprintf(stderr, "strata-nemotron: drafts accepted %llu of %llu (%llu windows)\n",
+                         (unsigned long long) (s2.spec_accepted - spec_a0), (unsigned long long) (s2.spec_drafted - spec_d0),
+                         (unsigned long long) (s2.spec_windows - spec_w0));
+        std::fprintf(stderr, "strata-nemotron: prompt %zu tokens (%zu reused) in %.0f ms (%.0f tok/s), %lld generated in "
+                             "%.0f ms (%.1f tok/s), expert hit rate %.1f%% (%lld slots a layer, K/V %lld cells)\n",
+                     prompt.size(), reused, prompt_ms, (prompt.size() - reused) / (prompt_ms / 1000.0), produced,
+                     decode_ms, produced > 1 ? (produced - 1) / (decode_ms / 1000.0) : 0.0,
+                     100.0 * s2.expert_hits / std::max<double>(1.0, (double) (s2.expert_hits + s2.expert_misses)),
+                     (long long) s2.slots_per_layer, (long long) s2.kv_cells);
+        {
+            const std::string pr = m.profile_report(true);
+            if (!pr.empty()) std::fprintf(stderr, "%s\n", pr.c_str());
+        }
+        if (quit_req.load()) break;
+    }
+    return 0;
+}
+
+/// --bench IDS: the first --ctx ids of the file as the prompt, then --gen greedy tokens; the speeds, the expert hit
+/// rate, the profile (STRATA_NEMO_PROFILE=1) and the generated ids (a regression check: an exact optimization keeps them).
+int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t gen, int probe, int spec,
+              float temp) {
+    std::vector<int32_t> ids;
+    {
+        FILE* f = std::fopen(path, "rb");
+        if (!f) { std::fprintf(stderr, "cannot open %s\n", path); return 1; }
+        long v;
+        while ((int64_t) ids.size() < ctx && std::fscanf(f, "%ld", &v) == 1) ids.push_back((int32_t) v);
+        std::fclose(f);
+    }
+    const int64_t n_vocab = m.geometry().n_vocab;
+    std::vector<float> lg((size_t) n_vocab);
+    std::string err;
+    m.reset();
+    auto t0 = Clock::now();
+    if (!m.forward(ids.data(), (int64_t) ids.size(), lg.data(), err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+    const double pms = ms_since(t0);
+    m.profile_report(true);
+    const auto s0 = m.stats();
+    std::vector<int32_t> out;
+    t0 = Clock::now();
+    if (spec > 0) {
+        // greedy speculation: spec_step until `gen` tokens
+        // --temp T: sampled (top_p 0.95, top_k 64, seed 1), else greedy
+        Sampling sp;
+        sp.temperature = temp;
+        sp.top_p = 0.95f;
+        sp.top_k = 64;
+        std::mt19937_64 rng(1);
+        const std::function<int32_t(const float*)> pick = [&](const float* l) { return sample(l, n_vocab, sp, rng); };
+        int32_t t = temp > 0 ? pick(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        std::vector<int32_t> got;
+        while ((int64_t) out.size() < gen) {
+            out.push_back(t);
+            if (!m.spec_step(t, spec, got, err, temp > 0 ? &pick : nullptr)) { std::fprintf(stderr, "spec: %s\n", err.c_str()); return 1; }
+            for (size_t k = 0; k + 1 < got.size() && (int64_t) out.size() < gen; ++k) out.push_back(got[k]);
+            t = got.back();
+        }
+        out.resize((size_t) gen);
+        const double dms = ms_since(t0);
+        m.profile_report(true);
+        const auto s1 = m.stats();
+        const double h = (double) (s1.expert_hits - s0.expert_hits), mi = (double) (s1.expert_misses - s0.expert_misses);
+        std::printf("bench: expert hits %llu, misses %llu, skipped %llu; prefetch issued %llu, used %llu, wasted %llu\n",
+                    (unsigned long long) (s1.expert_hits - s0.expert_hits),
+                    (unsigned long long) (s1.expert_misses - s0.expert_misses),
+                    (unsigned long long) (s1.expert_skips - s0.expert_skips),
+                    (unsigned long long) (s1.prefetch_issued - s0.prefetch_issued),
+                    (unsigned long long) (s1.prefetch_used - s0.prefetch_used),
+                    (unsigned long long) (s1.prefetch_wasted - s0.prefetch_wasted));
+        std::printf("bench: spec %d: %llu windows, %.2f of %d drafts accepted a window (%.0f%%), %.2f tokens a window\n",
+                    spec, (unsigned long long) (s1.spec_windows - s0.spec_windows),
+                    (double) (s1.spec_accepted - s0.spec_accepted) / (double) (s1.spec_windows - s0.spec_windows), spec,
+                    100.0 * (double) (s1.spec_accepted - s0.spec_accepted) / (double) (s1.spec_drafted - s0.spec_drafted),
+                    1.0 + (double) (s1.spec_accepted - s0.spec_accepted) / (double) (s1.spec_windows - s0.spec_windows));
+        std::printf("bench: prompt %zu tokens in %.0f ms (%.1f tok/s); %lld generated in %.0f ms (%.2f tok/s), expert hit %.1f%%\n",
+                    ids.size(), pms, ids.size() * 1000.0 / pms, (long long) gen, dms, gen * 1000.0 / dms, 100 * h / (h + mi));
+        std::printf("ids:");
+        for (int32_t v : out) std::printf(" %d", v);
+        std::printf("\n");
+        return 0;
+    }
+    std::vector<double> step;
+    std::vector<std::vector<int32_t>> drafts;   // --mtp-probe: the chain drafted before feeding out[i]
+    double draft_ms = 0;
+    for (int64_t i = 0; i < gen; ++i) {
+        const int32_t t = (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        out.push_back(t);
+        if (probe > 0 && m.has_mtp()) {
+            std::vector<int32_t> d((size_t) probe, -1);
+            const auto td = Clock::now();
+            if (!m.mtp_draft(t, probe, d.data(), err) && !err.empty()) { std::fprintf(stderr, "draft: %s\n", err.c_str()); return 1; }
+            draft_ms += ms_since(td);
+            drafts.push_back(d);
+        }
+        const auto ts = Clock::now();
+        if (!m.forward(&t, 1, lg.data(), err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+        step.push_back(ms_since(ts));
+    }
+    if (!step.empty()) {
+        std::vector<double> q(step);
+        std::sort(q.begin(), q.end());
+        std::printf("bench: step ms p10 %.2f, p50 %.2f, p90 %.2f, max %.2f\n", q[q.size() / 10], q[q.size() / 2],
+                    q[q.size() * 9 / 10], q.back());
+    }
+    const double dms = ms_since(t0);
+    const auto s1 = m.stats();
+    const double h = (double) (s1.expert_hits - s0.expert_hits), mi = (double) (s1.expert_misses - s0.expert_misses);
+    std::printf("bench: prefetch issued %llu, used %llu, wasted %llu; skipped %llu\n",
+                (unsigned long long) (s1.prefetch_issued - s0.prefetch_issued),
+                (unsigned long long) (s1.prefetch_used - s0.prefetch_used),
+                (unsigned long long) (s1.prefetch_wasted - s0.prefetch_wasted),
+                (unsigned long long) (s1.expert_skips - s0.expert_skips));
+    std::printf("bench: prompt %zu tokens in %.0f ms (%.1f tok/s); %lld generated in %.0f ms (%.2f tok/s), expert hit %.1f%%\n",
+                ids.size(), pms, ids.size() * 1000.0 / pms, (long long) gen, dms, gen * 1000.0 / dms, 100 * h / (h + mi));
+    const std::string pr = m.profile_report(true);
+    if (!pr.empty()) std::printf("%s\n", pr.c_str());
+    if (!drafts.empty()) {
+        // drafts[i][j] guesses out[i + 1 + j]; a chain is accepted up to its first miss
+        std::vector<int64_t> at_depth((size_t) probe + 1, 0);
+        int64_t n = 0, sum = 0;
+        for (size_t i = 0; i + (size_t) probe < out.size(); ++i) {
+            int k = 0;
+            while (k < probe && drafts[i][(size_t) k] == out[i + 1 + (size_t) k]) ++k;
+            ++at_depth[(size_t) k];
+            sum += k;
+            ++n;
+        }
+        std::printf("mtp probe: %lld chains of %d, mean accepted %.2f, draft %.2f ms a chain; accepted-length "
+                    "histogram:", (long long) n, probe, (double) sum / (double) n, draft_ms / (double) drafts.size());
+        for (int k = 0; k <= probe; ++k) std::printf(" %d:%lld", k, (long long) at_depth[(size_t) k]);
+        std::printf("\n");
+    }
+    std::printf("ids:");
+    for (int32_t t : out) std::printf(" %d", t);
+    std::printf("\n");
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    strata::core::NemoOptions o;
+    bool serve = false;
+    const char* ppl = nullptr;
+    const char* bench = nullptr;
+    int64_t ctx = 1024, chunks = 16, gen = 256;
+    int probe = 0, spec = 0;
+    float bench_temp = 0.0f;
+    const char* spec_list = nullptr;
+    const char* minp_list = nullptr;
+    bool bos_first = true, ppl_decode = false, ctx_given = false;
+    const char* ll_dump = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&](void) -> const char* {
+            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
+            return argv[++i];
+        };
+        if (a == "--gguf") o.gguf = next();
+        else if (a == "--experts-gguf") o.experts_gguf = next();
+        else if (a == "--max-context") { o.max_context = std::atoll(next()); ctx_given = true; }
+        else if (a == "--chunk") o.chunk = std::atoll(next());
+        else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(next());
+        else if (a == "--expert-slots") o.expert_slots = std::atoll(next());
+        else if (a == "--kv-base") o.kv_base = std::atoll(next());
+        else if (a == "--serve") serve = true;
+        else if (a == "--ppl") ppl = next();
+        else if (a == "--bench") bench = next();
+        else if (a == "--gen") gen = std::atoll(next());
+        else if (a == "--mtp") o.mtp = true;
+        else if (a == "--mtp-probe") { probe = std::atoi(next()); o.mtp = true; }
+        else if (a == "--spec") { spec = std::atoi(next()); g_spec = spec; o.mtp = true; }
+        else if (a == "--tail-skip") setenv("STRATA_NEMO_TAIL_SKIP", next(), 1);
+        else if (a == "--prefetch") setenv("STRATA_NEMO_PREFETCH", next(), 1);
+        else if (a == "--prefetch-rank") setenv("STRATA_NEMO_PREFETCH_RANK", next(), 1);
+        else if (a == "--spec-min-p") setenv("STRATA_NEMO_SPEC_MIN_P", next(), 1);
+        else if (a == "--mtp-slots") setenv("STRATA_NEMO_MTP_SLOTS", next(), 1);
+        else if (a == "--evict") setenv("STRATA_NEMO_EVICT", next(), 1);
+        else if (a == "--skip-w") setenv("STRATA_NEMO_SKIP_W", next(), 1);
+        else if (a == "--prompt-skip-w") setenv("STRATA_NEMO_PROMPT_SKIP_W", next(), 1);
+        else if (a == "--prompt-skip-max") setenv("STRATA_NEMO_PROMPT_SKIP_MAX", next(), 1);
+        else if (a == "--temp") bench_temp = (float) std::atof(next());
+        else if (a == "--spec-list") { spec_list = next(); o.mtp = true; }
+        else if (a == "--min-p-list") minp_list = next();
+        else if (a == "--ctx") ctx = std::atoll(next());
+        else if (a == "--chunks") chunks = std::atoll(next());
+        else if (a == "--no-bos") bos_first = false;
+        else if (a == "--ppl-decode") ppl_decode = true;
+        else if (a == "--ll-dump") ll_dump = next();
+        else std::fprintf(stderr, "strata-nemotron: ignoring %s\n", a.c_str());
+    }
+    if (o.gguf.empty() || (!serve && !ppl && !bench)) {
+        std::fprintf(stderr, "usage: %s --gguf FILE [--max-context N] [--chunk N] [--vram-reserve-mib N] "
+                             "[--expert-slots N] (--serve | --ppl IDS [--ctx N] [--chunks N] | --bench IDS [--ctx N] [--gen N])\n", argv[0]);
+        return 2;
+    }
+    if ((ppl || bench) && !ctx_given) o.max_context = std::max<int64_t>(ctx + gen, 1024);
+    strata::core::NemoModel m;
+    std::string err;
+    const auto t0 = Clock::now();
+    if (!m.load(o, err)) {
+        std::fprintf(stderr, "strata-nemotron: %s\n", err.c_str());
+        if (serve) std::printf("ERR %s\n", err.c_str());
+        return 1;
+    }
+    const auto st = m.stats();
+    std::fprintf(stderr, "strata-nemotron: loaded in %.1f s: dense %.2f GiB in VRAM, %lld expert slots per MoE layer "
+                         "(%.1f GiB), K/V %lld cells (grows to %lld), experts %s\n", ms_since(t0) / 1000.0,
+                 st.dense_gib, (long long) st.slots_per_layer, st.expert_cache_gib, (long long) st.kv_cells,
+                 (long long) m.max_context(), st.pinned ? "page-locked in place" : "NOT page-locked");
+    if (bench) {
+        // a sweep: every (spec, min_p) of --spec-list / --min-p-list over every file of a comma-separated --bench
+        std::vector<std::string> files;
+        {
+            std::string b = bench, cur;
+            for (char ch : b) { if (ch == ',') { files.push_back(cur); cur.clear(); } else cur += ch; }
+            if (!cur.empty()) files.push_back(cur);
+        }
+        auto list = [](const char* l, std::vector<double> dflt) {
+            if (!l) return dflt;
+            std::vector<double> v;
+            std::stringstream ss(l);
+            std::string x;
+            while (std::getline(ss, x, ',')) v.push_back(std::atof(x.c_str()));
+            return v;
+        };
+        const std::vector<double> specs = list(spec_list, {(double) spec});
+        const std::vector<double> minps = list(minp_list, {-1.0});
+        int rc = 0;
+        for (double sv : specs)
+            for (double mp : minps) {
+                if (mp >= 0) m.set_spec_min_p((float) mp);
+                for (const std::string& f : files) {
+                    std::printf("== spec %d min_p %.2f %s\n", (int) sv, mp, f.c_str());
+                    rc |= run_bench(m, f.c_str(), ctx, gen, probe, (int) sv, bench_temp);
+                    std::fflush(stdout);
+                }
+            }
+        return rc;
+    }
+    return ppl ? run_ppl(m, ppl, ctx, chunks, bos_first, ppl_decode, ll_dump) : run_serve(m);
+}
