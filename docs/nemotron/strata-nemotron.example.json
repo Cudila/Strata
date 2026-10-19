@@ -29,7 +29,7 @@
     "65536"
   ],
   "cwd": ".",
-  "tokenizer": "models/nemotron-tokenizer",
+  "tokenizer": "models/tokenizer",
   "model_name": "nemotron-3.5-super",
   "log": "strata-nemotron.log",
   "port": 10061,

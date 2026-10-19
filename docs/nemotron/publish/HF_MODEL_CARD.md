@@ -120,15 +120,17 @@ The engine on its own:
     --prompt-skip-w 0.3 --prompt-skip-max 8192 --serve
 ```
 
-With the OpenAI/Anthropic-compatible server (tool calls, reasoning, the chat template):
+With the OpenAI/Anthropic-compatible server (tool calls, reasoning, the chat template). Put both shards in
+`models/`, write the server's tokenizer folder from the GGUF once, then start it:
 
 ```sh
+python tools/strata_tokenizer.py --gguf models/Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf --out models
 python serve/server.py --engine strata --config docs/nemotron/strata-nemotron.example.json --port 8080
 ```
 
-The example config uses paths relative to the repository. The tokenizer folder it names holds `tokenizer.json`,
-`chat_template.jinja`, `vocab.json`, `merges.txt` and `token_type.json` (`tools/strata_tokenizer.py extract`). Give
-`--gguf` either shard: the other one is found next to it.
+The first command writes `models/tokenizer/`: vocabulary, merges and the chat template, all taken from the GGUF. The
+example config uses paths relative to the repository. `--gguf` takes either shard: the other one is found next to
+it.
 
 On startup the engine prints `loaded in … s: dense 6.63 GiB in VRAM, 140 expert slots per MoE layer (16.1 GiB), K/V
 65536 cells (grows to 1048576), experts page-locked in place`. On a 32 GB card a slot count well below 140 means

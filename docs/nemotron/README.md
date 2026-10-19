@@ -92,8 +92,9 @@ cmake --build build -j --target strata-nemotron
 ```
 
 The OpenAI-compatible server: `python serve/server.py --config <config>.json`. An example config:
-`docs/nemotron/strata-nemotron.example.json` (paths relative to the repository). The tokenizer folder holds `tokenizer.json` and
-`chat_template.jinja` from NVIDIA's checkpoint. Perplexity: `--ppl ids.txt --ctx 1024 --chunks 40`. Speed:
+`docs/nemotron/strata-nemotron.example.json` (paths relative to the repository, the shards in `models/`). Its
+tokenizer folder comes from the GGUF: `python tools/strata_tokenizer.py --gguf models/<shard 1> --out models` writes
+`models/tokenizer/` (vocabulary, merges, chat template). Perplexity: `--ppl ids.txt --ctx 1024 --chunks 40`. Speed:
 `--bench ids.txt --ctx N --gen 256`.
 
 Requirements: an RTX 50-series GPU (sm_120) with 32 GB, 128 GB of RAM, CUDA 13 (built with 13.3), Linux.
