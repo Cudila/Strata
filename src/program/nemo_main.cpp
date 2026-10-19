@@ -517,11 +517,12 @@ int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t
         m.profile_report(true);
         const auto s1 = m.stats();
         const double h = (double) (s1.expert_hits - s0.expert_hits), mi = (double) (s1.expert_misses - s0.expert_misses);
-        std::printf("bench: expert hits %llu, misses %llu, skipped %llu (%llu with no slot left); prefetch issued %llu, used %llu, wasted %llu\n",
+        std::printf("bench: expert hits %llu, misses %llu, skipped %llu (%llu with no slot left), %llu misses through the ring; prefetch issued %llu, used %llu, wasted %llu\n",
                     (unsigned long long) (s1.expert_hits - s0.expert_hits),
                     (unsigned long long) (s1.expert_misses - s0.expert_misses),
                     (unsigned long long) (s1.expert_skips - s0.expert_skips),
                     (unsigned long long) (s1.expert_forced_skips - s0.expert_forced_skips),
+                    (unsigned long long) (s1.expert_overflow - s0.expert_overflow),
                     (unsigned long long) (s1.prefetch_issued - s0.prefetch_issued),
                     (unsigned long long) (s1.prefetch_used - s0.prefetch_used),
                     (unsigned long long) (s1.prefetch_wasted - s0.prefetch_wasted));
@@ -629,6 +630,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = next();
         else if (a == "--gen") gen = std::atoll(next());
         else if (a == "--mtp") o.mtp = true;
+        else if (a == "--mtp-gguf") o.mtp_gguf = next();   // the MTP block from another GGUF (with --spec)
         else if (a == "--mtp-probe") { probe = std::atoi(next()); o.mtp = true; }
         else if (a == "--spec") { spec = std::atoi(next()); g_spec = spec; o.mtp = true; }
         else if (a == "--tail-skip") setenv("STRATA_NEMO_TAIL_SKIP", next(), 1);

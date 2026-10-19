@@ -124,11 +124,17 @@ Emulated on the 5090 at 15,800 MiB (40 expert slots a layer):
 
 | | 4K | 32K | 128K | 256K |
 |---|---:|---:|---:|---:|
-| prefill, tok/s | 2 378 | 4 626 | 4 422 | 3 911 |
-| decode with MTP, tok/s | 61 | 73 | 93 | 58 |
+| prefill, tok/s | 2 297–2 378 | 4 005–4 626 | 4 422 | 3 911 |
+| decode with MTP, tok/s | 61 | 73–75 | 93 | 58 |
 
 The decode PPL is ×1.010 against no skipping. The fast mode costs ×1.17 here, because with few slots most misses are
 skipped. 64 GB of RAM still needs the SSD tier (ROADMAP item 3).
+
+### Other MTP heads
+
+`--mtp-gguf FILE` takes the MTP block from another GGUF, e.g. ggml-org's `mtp-*.gguf` (BF16 / Q8_0 / Q4_0). Their
+acceptance is the same as the file's own NVFP4 block within ±3% (OPTIMIZATION_NOTES section 7), so the default
+stays.
 
 ### Images
 

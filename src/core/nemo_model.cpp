@@ -29,6 +29,27 @@ using strata::kernels::NemoWType;
 
 namespace {
 
+float half_to_float(uint16_t h) {
+    const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31u, m = h & 1023u;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) f = s;
+        else {   // subnormal
+            float v = (float) m / 1024.0f / 16384.0f;
+            return s ? -v : v;
+        }
+    } else if (e == 31) f = s | 0x7f800000u | (m << 13);
+    else f = s | ((e + 112u) << 23) | (m << 13);
+    float v;
+    std::memcpy(&v, &f, 4);
+    return v;
+}
+uint16_t float_to_bf16(float v) {   // round to nearest even
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
 #define NCK(x)                                                                                    \
     do {                                                                                          \
         cudaError_t e_ = (x);                                                                     \
@@ -123,6 +144,7 @@ struct ExpertRows {
 struct NemoModel::Impl {
     std::unique_ptr<strata::GgufModel> gguf;
     std::unique_ptr<strata::GgufModel> xgguf;   ///< --experts-gguf: the routed experts' tensors from another file
+    std::unique_ptr<strata::GgufModel> mgguf;   ///< --mtp-gguf
     std::vector<Block> blocks;
     std::vector<ExpertLayer> ex;
     uint64_t blob = 0;   ///< a slot: the largest layer's up + down
@@ -509,6 +531,8 @@ struct NemoModel::Impl {
     // stream in while this layer and the Mamba / attention between compute
     cudaStream_t cst = nullptr;
     cudaEvent_t cev = nullptr;
+    cudaEvent_t ovf_ev[2] = {nullptr, nullptr};   ///< decode's ring overflow halves: free after this event
+    bool ovf_rec[2] = {false, false};
     bool prefetch = !std::getenv("STRATA_NEMO_PREFETCH") || std::atoi(std::getenv("STRATA_NEMO_PREFETCH")) != 0;
     bool evict_lfu = std::getenv("STRATA_NEMO_EVICT") && !std::strcmp(std::getenv("STRATA_NEMO_EVICT"), "lfu");
     double lfu_decay = std::getenv("STRATA_NEMO_LFU_DECAY") ? std::atof(std::getenv("STRATA_NEMO_LFU_DECAY")) : 0.97;
@@ -562,6 +586,7 @@ struct NemoModel::Impl {
         int32_t* d_tok = nullptr;
         int32_t* h_tok = nullptr;   ///< pinned
         uint16_t* stage = nullptr;  ///< pinned, MC rows
+        NemoWType tu = NemoWType::NVFP4, td = NemoWType::NVFP4;   ///< the experts' types (--mtp-gguf: any)
         const uint8_t** ptr = nullptr;
         float* s2 = nullptr;
         bool pending = false;
@@ -661,14 +686,33 @@ struct NemoModel::Impl {
             err = "missing tensor " + name;
             return false;
         }
-        if (t->type != 40 && t->type != 8 && t->type != 30 && t->type != 0) {
-            err = name + " is " + t->type_name() + ": the v1 runner reads NVFP4, Q8_0, BF16 and F32 matrices";
+        if (t->type != 40 && t->type != 8 && t->type != 30 && t->type != 0 && t->type != 2) {
+            err = name + " is " + t->type_name() + ": the v1 runner reads NVFP4, Q8_0, Q4_0, BF16 and F32 matrices";
             return false;
         }
         m.t = (NemoWType) t->type;
         m.cols = (int64_t) t->shape[0];
         m.rows = (int64_t) t->shape[1];
         m.s2 = 1.0f;
+        std::vector<uint16_t> q4;   // a Q4_0 matrix (an MTP file's) goes in as its exact BF16 values
+        const uint8_t* src_override = nullptr;
+        if (t->type == 2) {
+            const uint8_t* q = nullptr;
+            tensor(name, &q);
+            q4.resize((size_t) m.rows * m.cols);
+            for (int64_t i = 0; i < m.rows * m.cols / 32; ++i) {
+                const uint8_t* blk = q + (size_t) i * 18;
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                const float d = half_to_float(dh);
+                for (int j = 0; j < 16; ++j) {
+                    q4[(size_t) i * 32 + j] = float_to_bf16(d * (float) ((blk[2 + j] & 15) - 8));
+                    q4[(size_t) i * 32 + j + 16] = float_to_bf16(d * (float) ((blk[2 + j] >> 4) - 8));
+                }
+            }
+            m.t = NemoWType::BF16;
+            src_override = reinterpret_cast<const uint8_t*>(q4.data());
+        }
         if (t->type == 40) {
             const uint8_t* sp = nullptr;
             const strata::TensorInfo* sc = tensor(name.substr(0, name.size() - 7) + ".scale", &sp);
@@ -680,14 +724,20 @@ struct NemoModel::Impl {
         }
         // NVFP4 / Q8_0 / BF16 go in the tiled layout (STRATA_NEMO_TILED=0: the GGUF rows and the CUDA-core kernels)
         if (tiled_ok && strata::kernels::nemo_tc_gemv_ok(m.t, m.cols, 1)) {
-            const uint8_t* src = nullptr;
-            tensor(name, &src);
+            const uint8_t* src = src_override;
+            if (!src) tensor(name, &src);
             std::vector<uint8_t> tl((size_t) strata::kernels::nemo_tiled_bytes(m.t, m.rows, m.cols));
             strata::kernels::nemo_tiled_repack(m.t, src, m.rows, m.cols, tl.data());
             if (!alloc(&m.d, tl.size(), err)) return false;
             NCK(cudaMemcpy(m.d, tl.data(), tl.size(), cudaMemcpyHostToDevice));
             if (bytes) *bytes += tl.size();
             m.tiled = true;
+            return true;
+        }
+        if (src_override) {
+            if (!alloc(&m.d, q4.size() * 2, err)) return false;
+            NCK(cudaMemcpy(m.d, src_override, q4.size() * 2, cudaMemcpyHostToDevice));
+            if (bytes) *bytes += q4.size() * 2;
             return true;
         }
         return upload(name, &m.d, err, bytes);
@@ -1136,6 +1186,19 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
 
     vram_mark("chunk scratch");
     // ---- the MTP block, resident (its experts too: ~1.5 GiB that the expert cache does not get) ----
+    // --mtp-gguf: the block's tensors from that file (ggml-org's mtp-*.gguf: BF16, Q8_0 or Q4_0), the embeddings and
+    // lm_head still the main file's; I.gguf points at it while the block loads
+    std::unique_ptr<strata::GgufModel> main_gguf;
+    if (opt.mtp && !opt.mtp_gguf.empty()) {
+        try {
+            main_gguf = std::move(I.gguf);
+            I.gguf.reset(new strata::GgufModel(strata::gguf_split_paths(opt.mtp_gguf)));
+        } catch (const std::exception& e) {
+            err = std::string("--mtp-gguf: ") + e.what();
+            return false;
+        }
+        std::fprintf(stderr, "strata-nemotron: the MTP block from %s\n", opt.mtp_gguf.c_str());
+    }
     if (opt.mtp) {
         const std::string p = "blk." + std::to_string(g_.n_layers) + ".";
         Impl::Mtp& M = I.mtp;
@@ -1162,12 +1225,15 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
             const uint8_t *up = nullptr, *dn = nullptr;
             const strata::TensorInfo* tu = I.tensor(p + "ffn_up_exps.weight", &up);
             const strata::TensorInfo* td = I.tensor(p + "ffn_down_exps.weight", &dn);
-            if (!tu || !td || tu->type != 40 || td->type != 40) {
-                err = "the MTP block's experts must be NVFP4";
+            auto mtp_type = [](uint32_t ty) { return ty == 40 || ty == 8 || ty == 30 || ty == 2; };
+            if (!tu || !td || !mtp_type(tu->type) || !mtp_type(td->type)) {
+                err = "the MTP block's experts must be NVFP4, Q8_0, Q4_0 or BF16";
                 return false;
             }
-            M.ub = strata::kernels::nemo_row_bytes(NemoWType::NVFP4, L) * FF;
-            const uint64_t mdb = strata::kernels::nemo_row_bytes(NemoWType::NVFP4, FF) * L;
+            M.tu = (NemoWType) tu->type;
+            M.td = (NemoWType) td->type;
+            M.ub = strata::kernels::nemo_row_bytes(M.tu, L) * FF;
+            const uint64_t mdb = strata::kernels::nemo_row_bytes(M.td, FF) * L;
             M.stride = (M.ub + mdb + 15) / 16 * 16;
             // STRATA_NEMO_MTP_SLOTS=N (< 512): the MTP's experts in a cache of N slots over a page-locked copy; a
             // draft skips a missing expert (it only proposes: a weaker draft is refused, never wrong) and the copy
@@ -1231,6 +1297,10 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
                 return false;
             NCK(cudaMallocHost((void**) &I.h_vtok, MMr * sizeof(int32_t)));
         }
+    }
+    if (main_gguf) {   // the main file again (the MTP file stays open: its mapping backs nothing now, but cheap)
+        I.mgguf = std::move(I.gguf);
+        I.gguf = std::move(main_gguf);
     }
 
     stats_.dense_gib = dense / 1073741824.0;
@@ -1718,6 +1788,13 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         return v;
                     };
                     std::vector<uint8_t> skip_of(uniq.size(), 0);
+                    // a pass with more distinct misses than free slots (a verify window on a small cache): the extra
+                    // ones are copied into half (layer parity) of the prompt's ring - idle in decode - so the window
+                    // stays exact; the half is reused two layers on, after the compute that read it (ovf_ev)
+                    std::vector<const uint8_t*> ovf(uniq.size(), nullptr);
+                    const int ohalf = (int) (b.moe & 1);
+                    const int64_t ocap = I.ring ? I.ring_n / 2 : 0;
+                    int64_t on = 0;
                     for (size_t u = 0; u < uniq.size(); ++u) {
                         const int32_t e = uniq[u];
                         if (X.slot_of[(size_t) e] >= 0) continue;
@@ -1729,9 +1806,19 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                             continue;
                         }
                         const int32_t sl = victim(X, PF, p0);
+                        if (sl < 0 && on < ocap) {
+                            if (on == 0 && I.ovf_rec[ohalf]) NCK(cudaStreamWaitEvent(I.cst, I.ovf_ev[ohalf], 0));
+                            uint8_t* dst = I.ring + (size_t) (ohalf * ocap + on++) * I.blob;
+                            cudaMemcpyAsync(dst, X.up + (size_t) e * X.ub, X.ub, cudaMemcpyHostToDevice, I.cst);
+                            cudaMemcpyAsync(dst + X.ub, X.dn + (size_t) e * X.db, X.db, cudaMemcpyHostToDevice, I.cst);
+                            ovf[u] = dst;
+                            ready_of[u] = 0;
+                            ++stats_.expert_misses;
+                            ++stats_.expert_overflow;
+                            continue;
+                        }
                         if (sl < 0) {
-                            // every slot holds an expert of this pass (a verify window on a small card: more distinct
-                            // experts than slots): this one is skipped too
+                            // no slot and no ring left: this one is skipped too (the window is then not exact)
                             skip_of[u] = 1;
                             ++stats_.expert_skips;
                             ++stats_.expert_forced_skips;
@@ -1754,7 +1841,7 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         const size_t u = (size_t) where[(size_t) e];
                         const bool ready = skip_of[u] || ready_of[u];
                         const int64_t at = ready ? na++ : KT - 1 - nb_++;
-                        const uint8_t* bl = skip_of[u] ? I.zero_blob : I.slot_ptr(X, X.slot_of[(size_t) e]);
+                        const uint8_t* bl = skip_of[u] ? I.zero_blob : ovf[u] ? ovf[u] : I.slot_ptr(X, X.slot_of[(size_t) e]);
                         mptr[at] = bl;
                         mptr[KM + at] = bl + X.ub;
                         ms2[at] = skip_of[u] ? 0.0f : X.s_up[(size_t) e];
@@ -1780,6 +1867,11 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                                                            L, FF, st);
                     if (T == 1) strata::kernels::nemo_experts_sum(I.w, I.eh, I.routed, K, L, FF, st);
                     else strata::kernels::nemo_weighted_rows(I.eh + (size_t) KT * FF, I.w, I.routed, T, K, L, st);
+                    if (on > 0) {   // the ring half is free again once this compute is done
+                        if (!I.ovf_ev[ohalf]) NCK(cudaEventCreateWithFlags(&I.ovf_ev[ohalf], cudaEventDisableTiming));
+                        NCK(cudaEventRecord(I.ovf_ev[ohalf], st));
+                        I.ovf_rec[ohalf] = true;
+                    }
                     if (I.zero_stats) {
                         if (I.zs.size() < I.ex.size()) I.zs.resize(I.ex.size(), std::array<uint64_t, 5>{});
                         I.zs_host.resize((size_t) KT * FF);
@@ -2351,7 +2443,7 @@ bool NemoModel::mtp_rows(const int32_t* toks, const float* h, int64_t n, int64_t
             NCK(cudaMemcpyAsync(M.ptr, hp, 2 * K * sizeof(void*), cudaMemcpyHostToDevice, st));
             NCK(cudaMemcpyAsync(M.s2, hs, 2 * K * sizeof(float), cudaMemcpyHostToDevice, st));
         }
-        strata::kernels::nemo_experts_part(NemoWType::NVFP4, NemoWType::NVFP4, M.ptr, M.ptr + K, M.s2, M.s2 + K,
+        strata::kernels::nemo_experts_part(M.tu, M.td, M.ptr, M.ptr + K, M.s2, M.s2 + K,
                                            nullptr, nullptr, K, I.lat, I.eh, K, L, FF, st);
         strata::kernels::nemo_experts_sum(I.w, I.eh, I.routed, K, L, FF, st);
         I.gemm(M.fc2, I.routed, L, r, E, 1, false, true);

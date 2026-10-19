@@ -21,7 +21,8 @@ namespace strata::kernels {
 
 /// The ggml type ids.  Q2_0 / IQ4_NL / IQ4_XS / IQ3_XXS are expert formats only (nemo_gemv, nemo_gemv_many and the
 /// prompt's dequantization; nemo_gemm itself has the first four).
-enum class NemoWType : int { NVFP4 = 40, Q8_0 = 8, BF16 = 30, F32 = 0, Q2_0 = 42, IQ4_NL = 20, IQ4_XS = 23, IQ3_XXS = 18 };
+enum class NemoWType : int { NVFP4 = 40, Q8_0 = 8, BF16 = 30, F32 = 0, Q2_0 = 42, IQ4_NL = 20, IQ4_XS = 23, IQ3_XXS = 18,
+                             Q4_0 = 2 };
 
 /// Values per block of `t` (a row's length is a multiple of it).
 int64_t nemo_block_values(NemoWType t);

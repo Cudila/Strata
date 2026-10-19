@@ -235,6 +235,14 @@ struct DIq4nl : BySub<DIq4nl> {   // 32 values, 18 bytes: f16 d, 16 bytes (byte 
     }
 };
 
+struct DQ4_0 : BySub<DQ4_0> {   // 32 values, 18 bytes: f16 d, 16 bytes (as IQ4_NL), value = d * (nibble - 8)
+    static constexpr int VALS = 32, BYTES = 18, TAB = 16;
+    __device__ static void init(float* t) {
+        if (threadIdx.x < 16) t[threadIdx.x] = (float) ((int) threadIdx.x - 8);
+    }
+    __device__ static void deq(const uint8_t* blk, int sb, const float* tab, float* w) { DIq4nl::deq(blk, sb, tab, w); }
+};
+
 struct DIq4xs : BySub<DIq4xs> {   // 256 values, 136 bytes: f16 d, u16 scales_h, 4 scales_l, 128 bytes of nibbles
     static constexpr int VALS = 256, BYTES = 136, TAB = 16;
     __device__ static void init(float* t) {
@@ -1012,6 +1020,9 @@ void nemo_gemv_many(NemoWType t, const uint8_t* const* w, const float* scale2, c
     case NemoWType::IQ4_NL: NEMO_MANY(DIq4nl); break;
     case NemoWType::IQ4_XS: NEMO_MANY(DIq4xs); break;
     case NemoWType::IQ3_XXS: NEMO_MANY(DIq3xxs); break;
+    case NemoWType::Q4_0: NEMO_MANY(DQ4_0); break;
+    case NemoWType::Q8_0: NEMO_MANY(DQ8); break;
+    case NemoWType::BF16: NEMO_MANY(DBf16); break;
     default: break;
     }
 #undef NEMO_MANY

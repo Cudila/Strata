@@ -186,6 +186,7 @@ uint64_t nemo_row_bytes(NemoWType t, int64_t cols) {
     switch (t) {
     case NemoWType::Q2_0: return (uint64_t) cols / 64 * 18;
     case NemoWType::IQ4_NL: return (uint64_t) cols / 32 * 18;
+    case NemoWType::Q4_0: return (uint64_t) cols / 32 * 18;
     case NemoWType::IQ4_XS: return (uint64_t) cols / 256 * 136;
     case NemoWType::IQ3_XXS: return (uint64_t) cols / 256 * 98;
     case NemoWType::NVFP4: return (uint64_t) cols / 64 * 36;

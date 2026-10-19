@@ -41,11 +41,13 @@ struct NemoOptions {
     /// from the expert cache (and giving it back at the next reset), up to max_context
     int64_t kv_base = 262144;
     bool mtp = false;                 ///< load the MTP block (resident) for drafting
+    std::string mtp_gguf;             ///< the MTP block (blk.<n_layers>.*) from another GGUF, e.g. ggml-org's mtp-*.gguf
 };
 
 struct NemoStats {
     uint64_t expert_hits = 0, expert_misses = 0, expert_skips = 0;
     uint64_t expert_forced_skips = 0;   ///< of the skips: misses with no slot left in their pass (small cards)
+    uint64_t expert_overflow = 0;       ///< of the misses: copied into the ring for want of a slot (exact)
     uint64_t prefetch_issued = 0, prefetch_used = 0, prefetch_wasted = 0;
     uint64_t spec_windows = 0, spec_drafted = 0, spec_accepted = 0;
     int64_t slots_per_layer = 0;

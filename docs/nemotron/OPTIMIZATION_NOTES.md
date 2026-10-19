@@ -279,3 +279,31 @@ What integration needs:
   tile in shared memory), the CUDA-core path of small chunks, the BF16 dequantization.
 
 The list can come almost free from the `up` kernel's relu² epilogue.
+
+## 7. Community MTP heads (2026-10-19)
+
+ggml-org publishes the MTP block separately: `mtp-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-{BF16,Q8_0,Q4_0}.gguf`, made
+from the BF16 checkpoint. `--mtp-gguf FILE` loads `blk.88.*` from such a file:
+- the embeddings and `lm_head` stay the main file's;
+- the experts may be NVFP4, Q8_0, Q4_0 or BF16 (a Q4_0 GEMV decoder was added);
+- Q4_0 dense matrices go in as their exact BF16 values.
+
+Measured greedy with no skipping, so the main model's output is bit-identical in every row (checked by the generated
+ids), on wikitext at 4K / 32K:
+
+| MTP block | experts | VRAM (slots lost) | tokens a window, 4K | 32K |
+|---|---|---:|---:|---:|
+| ours (NVIDIA's NVFP4 checkpoint) | NVFP4 | 1.5 GiB | 2.14 | 3.12 |
+| ggml-org Q4_0 | Q4_0 | 1.6 GiB (0) | 2.16 | 3.01 |
+| ggml-org Q8_0 | Q8_0 | 3.0 GiB (8) | 2.20 | 3.16 |
+| ggml-org BF16 | BF16 | 5.6 GiB (32) | 2.19 | — |
+
+They are the same within ±3%. A first run in the fast preset seemed to show BF16 far ahead (4.01 against 2.39). That
+was an artefact: skipping depends on the cache, so different slot counts made the main model write different text.
+The default stays the file's own NVFP4 block. NVIDIA's LiLiCorr drafter (DFlash) is a different architecture and is
+not implemented.
+
+The same A/B found a real bug. With fewer expert slots than a verify window's distinct experts (6 rows × 22 = 132),
+the window used to skip the extra misses, so speculation stopped being exact (10 skips in 512 tokens at 108 slots).
+Such misses now go through half of the prompt's ring (idle in decode, alternating halves by layer, freed by an event
+after the compute that read them). At 108 / 64 / 40 slots the speculative output is bit-identical to plain decode.
