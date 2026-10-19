@@ -124,7 +124,7 @@ Put `mmproj-BF16.gguf` in `models/`. The example config's `"vision"` section the
 
 ## Not done
 
-- Video (the encoder's two-frame path and the token pruning across frames).
+- Video (the encoder's two-frame path and the token pruning across frames). The plan of work: `docs/nemotron/ROADMAP.md`.
 - Windows, AMD/HIP, other GPUs and smaller RAM sizes: not built or tested.
 - Attention reaches ~40% of its ceiling: register-bound, one block per SM. At 1M, attention is most of the prompt
   time.

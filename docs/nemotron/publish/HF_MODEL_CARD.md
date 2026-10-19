@@ -29,6 +29,10 @@ license_link: https://openmdw.ai/license/1-1/
 > [`mmproj-BF16.gguf`](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) and a patched
 > llama.cpp (see *Images* below). Its embeddings match NVIDIA's own code to a per-token cosine of ≥ 0.998. Video is
 > not done yet.
+>
+> **16 GB VRAM + 64 GB RAM: in development.** Cold experts will be streamed from an NVMe SSD (VRAM cache → RAM cache →
+> SSD), so the model can run on a 16 GB RTX 50-series card in a 64 GB machine. Today it needs 32 GB of VRAM and 128 GB
+> of RAM (see *Hardware configurations*).
 
 This repo has a GGUF of the text model of
 [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
@@ -224,7 +228,7 @@ What decides whether this runs is where its parts live:
 | ---: | :--- | ---: | :--- |
 | 32 GB | 5090 | 140 | **measured**: the tables above |
 | 24 GB | 5090 Laptop | 72 | **emulated** on the 5090 by leaving the engine 24 GB: prefill 4K 2,382 t/s, 32K 9,153 t/s; decode 121 / 198 t/s at 4K / 32K. Within a few % of the 32 GB row. The 1M context will not fit: its KV takes 56 slots, leaving fewer than 22 |
-| 16 GB | 5080, 5070 Ti, 5060 Ti 16G | 13 | **does not start**, emulated the same way: the engine needs 22 slots a layer, one token's experts |
+| 16 GB | 5080, 5070 Ti, 5060 Ti 16G | 13 | **does not start yet**, emulated the same way: the engine needs 22 slots a layer, one token's experts. **In development**, with 64 GB of RAM: cold experts on the SSD |
 | 12 GB and below | 5070, 5060 | — | does not start |
 
 The 24 GB row was emulated with `--vram-reserve-mib` on the same card. So it shows what a smaller cache costs, not
