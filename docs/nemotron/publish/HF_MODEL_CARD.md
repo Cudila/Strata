@@ -30,9 +30,9 @@ license_link: https://openmdw.ai/license/1-1/
 > llama.cpp (see *Images* below). Its embeddings match NVIDIA's own code to a per-token cosine of ≥ 0.998. Video is
 > not done yet.
 >
-> **16 GB VRAM + 64 GB RAM: in development.** Cold experts will be streamed from an NVMe SSD (VRAM cache → RAM cache →
-> SSD), so the model can run on a 16 GB RTX 50-series card in a 64 GB machine. Today it needs 32 GB of VRAM and 128 GB
-> of RAM (see *Hardware configurations*).
+> **16 GB cards work** (5080, 5070 Ti, 5060 Ti 16G; with 128 GB of RAM). With MTP and the precise decode: 53–78 t/s
+> decode, ~4,600 t/s prefill at 32K, decode PPL ×1.010. Measured by emulation on the 5090 (`--vram-limit-mib 15800`),
+> see *Hardware configurations*. **64 GB of RAM is in development:** cold experts streamed from an NVMe SSD.
 
 This repo has a GGUF of the text model of
 [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
@@ -258,10 +258,10 @@ What decides whether this runs is where its parts live:
 | ---: | :--- | ---: | :--- |
 | 32 GB | 5090 | 140 | **measured**: the tables above |
 | 24 GB | 5090 Laptop | 72 | **emulated** on the 5090 by leaving the engine 24 GB: prefill 4K 2,328–2,382 t/s, 32K 9,040–9,153 t/s; decode at 4K / 32K 121 / 198 t/s fast (as the 32 GB row), 64 / 93 t/s precise (−27% against the 32 GB row). The 1M context will not fit: its KV takes 56 slots, leaving fewer than 22 |
-| 16 GB | 5080, 5070 Ti, 5060 Ti 16G | 13 | **does not start yet**, emulated the same way: the engine needs 22 slots a layer, one token's experts. **In development**, with 64 GB of RAM: cold experts on the SSD |
+| 16 GB | 5080, 5070 Ti, 5060 Ti 16G | 40 (MTP) / 64 | **emulated**: `--vram-limit-mib 15800` (the process stays under 15.8 GB, its CUDA context included), the small-card profile (8192-row chunk, a 48-blob prompt ring), MTP, precise decode. Decode 78 t/s at 4K, 69–74 t/s at 32K–256K; prefill 4,625 t/s at 32K (chunk 8192). Decode PPL ×1.010 (×1.17 in the fast mode: do not use it here). The vision encoder runs on the CPU (`docs/nemotron/strata-nemotron-16gb.example.json`). Context up to 256K tested |
 | 12 GB and below | 5070, 5060 | — | does not start |
 
-The 24 GB row was emulated with `--vram-reserve-mib` on the same card. So it shows what a smaller cache costs, not
+The 24 GB row was emulated with `--vram-reserve-mib` on the same card, the 16 GB row with `--vram-limit-mib`. So it shows what a smaller cache costs, not
 what a laptop GPU's lower compute and power limit cost: read it as an upper bound.
 
 In the fast mode a half-size cache is nearly free: the misses it adds are mostly experts whose weight is below the

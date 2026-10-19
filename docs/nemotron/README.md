@@ -114,6 +114,22 @@ tokenizer folder comes from the GGUF: `python tools/strata_tokenizer.py --gguf m
 
 Requirements: an RTX 50-series GPU (sm_120) with 32 GB, 128 GB of RAM, CUDA 13 (built with 13.3), Linux.
 
+### 16 GB cards
+
+`--vram-limit-mib N` caps the process at N MiB (its CUDA context included). A card or a limit under 20 GiB gets the
+small-card profile: an 8192-row chunk and a 48-blob prompt ring. `docs/nemotron/strata-nemotron-16gb.example.json` is
+the config: MTP, precise decode (`--prefetch 1`), context 256K, the vision encoder on the CPU.
+
+Emulated on the 5090 at 15,800 MiB (40 expert slots a layer):
+
+| | 4K | 32K | 128K | 256K |
+|---|---:|---:|---:|---:|
+| prefill, tok/s | — | 4 625 | — | — |
+| decode with MTP, tok/s | 78 | 74 | 64 | 74 |
+
+The decode PPL is ×1.010 against no skipping. The fast mode costs ×1.17 here, because with few slots most misses are
+skipped. 64 GB of RAM still needs the SSD tier (ROADMAP item 3).
+
 ### Images
 
 The image encoder is `strata-vision` with Unsloth's `mmproj-BF16.gguf`

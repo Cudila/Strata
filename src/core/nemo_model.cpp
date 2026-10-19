@@ -861,6 +861,10 @@ bool NemoModel::set_image_rows(const float* rows, const std::vector<std::pair<in
 
 bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     Impl& I = *impl_;
+    // the process's VRAM before its first allocation: --vram-limit-mib counts from here (plus the context's, see below)
+    size_t free0 = 0, total0 = 0;
+    cudaFree(0);
+    cudaMemGetInfo(&free0, &total0);
     try {
         I.gguf.reset(new strata::GgufModel(strata::gguf_split_paths(opt.gguf)));
         if (!opt.experts_gguf.empty())
@@ -891,6 +895,18 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     const int64_t C = I.C;
     uint64_t dense = 0;
 
+    // STRATA_NEMO_VRAM_REPORT=1: the card's used memory after each part of the load (cudaMemGetInfo deltas)
+    const bool vram_report = std::getenv("STRATA_NEMO_VRAM_REPORT") != nullptr;
+    size_t vram_last = 0;
+    auto vram_mark = [&](const char* what) {
+        if (!vram_report) return;
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        const size_t used = tot - fr;
+        if (vram_last) std::fprintf(stderr, "vram: %-36s %8.1f MiB\n", what, (double) (used - vram_last) / 1048576.0);
+        vram_last = used;
+    };
+    vram_mark("start");
     // ---- dense weights and per-sequence state ----
     I.blocks.resize((size_t) g_.n_layers);
     int moe_i = 0, mamba_i = 0;
@@ -959,6 +975,7 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     }
     stats_.dense_gib = dense / 1073741824.0;
 
+    vram_mark("dense weights + state");
     // ---- the experts: in place in the mapping, page-locked ----
     I.ex.resize((size_t) moe_i);
     I.pq_first.assign((size_t) moe_i, SIZE_MAX);
@@ -1040,6 +1057,7 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     }
     stats_.pinned = I.pinned;
 
+    vram_mark("expert arena (host)");
     // ---- scratch for a chunk of C rows ----
     // The Mamba blocks and the shared expert run over the chunk in sub-chunks of SC rows (the scan carries its state
     // across them), so their wide buffers (zx 18,560 floats a row, the shared expert's 5,376) are SC rows, not C.
@@ -1116,6 +1134,7 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
         I.snap_conv.push_back(c);
     }
 
+    vram_mark("chunk scratch");
     // ---- the MTP block, resident (its experts too: ~1.5 GiB that the expert cache does not get) ----
     if (opt.mtp) {
         const std::string p = "blk." + std::to_string(g_.n_layers) + ".";
@@ -1252,6 +1271,7 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     NCK(cudaMallocHost((void**) &I.hp_meta, (size_t) moe_i * I.meta_bytes));
     if (!I.alloc((void**) &I.d_meta, I.meta_bytes, err)) return false;
 
+    vram_mark("MTP + spec + ring + prompt buffers");
     // ---- the K/V cache's base pages, then the expert cache: what is left of the card ----
     I.kd = KD;
     I.n_kv_heads = g_.n_head_kv;
@@ -1279,11 +1299,19 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     int64_t per = opt.expert_slots;
     uint64_t all_strides = 0;
     for (const ExpertLayer& X : I.ex) all_strides += X.stride;
-    if (per <= 0) per = ((int64_t) free_b - reserve) / (int64_t) all_strides;
+    int64_t avail = (int64_t) free_b - reserve;
+    if (opt.vram_limit_mib > 0) {
+        // the limit covers the process: what it allocated since the start, and its CUDA context (~0.5 GiB, measured
+        // on CUDA 13 with this engine's kernels loaded)
+        const int64_t ctx = 512ll << 20;
+        const int64_t mine = (int64_t) free0 - (int64_t) free_b + ctx;
+        avail = std::min<int64_t>(avail, opt.vram_limit_mib * (1ll << 20) - mine);
+    }
+    if (per <= 0) per = avail / (int64_t) all_strides;
     per = std::min<int64_t>(per, NE);
     if (per < K) {
-        err = "only " + std::to_string(per) + " expert slots per layer fit (" + std::to_string(free_b >> 20) +
-              " MiB free); at least " + std::to_string(K) + " are needed";
+        err = "only " + std::to_string(per) + " expert slots per layer fit (" + std::to_string(std::max<int64_t>(0, avail) >> 20) +
+              " MiB left for them); at least " + std::to_string(K) + " are needed";
         return false;
     }
     per = per / Impl::BS * Impl::BS;
@@ -1328,6 +1356,7 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
     I.lend();
     stats_.slots_per_layer = I.slots;
     stats_.expert_cache_gib = (double) I.slots * all_strides / 1073741824.0;
+    vram_mark("K/V base pages + expert cache");
     reset();
     return true;
 }
@@ -1699,8 +1728,16 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                             ++stats_.expert_skips;
                             continue;
                         }
-                        ++stats_.expert_misses;
                         const int32_t sl = victim(X, PF, p0);
+                        if (sl < 0) {
+                            // every slot holds an expert of this pass (a verify window on a small card: more distinct
+                            // experts than slots): this one is skipped too
+                            skip_of[u] = 1;
+                            ++stats_.expert_skips;
+                            ++stats_.expert_forced_skips;
+                            continue;
+                        }
+                        ++stats_.expert_misses;
                         X.expert_in[(size_t) sl] = e;
                         X.slot_of[(size_t) e] = sl;
                         X.used[(size_t) sl] = p0;

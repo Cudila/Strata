@@ -34,6 +34,10 @@ histograms.
 
 ### 3. 16 GB VRAM + 64 GB RAM: cold experts on the SSD
 
+**16 GB VRAM: done (2026-10-19).** `--vram-limit-mib`, the small-card profile, and a fix for a verify window that wants
+more distinct experts than a layer has slots (such a miss is now skipped, not written past the slots). Numbers: README
+*16 GB cards*. What is left is the RAM side: 64 GB.
+
 Today the engine needs 32 GB of VRAM and 128 GB of RAM:
 - on 16 GB only 13 expert slots a layer fit, and 22 are needed for one token;
 - the 59 GiB arena of page-locked experts does not fit in 64 GB.

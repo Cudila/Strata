@@ -26,6 +26,8 @@
 //                        (--serve | --ppl IDS [--ctx 1024] [--chunks 16] | --bench IDS [--ctx N] [--gen N] [--temp T])
 #include "strata/core/nemo_model.hpp"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -515,10 +517,11 @@ int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t
         m.profile_report(true);
         const auto s1 = m.stats();
         const double h = (double) (s1.expert_hits - s0.expert_hits), mi = (double) (s1.expert_misses - s0.expert_misses);
-        std::printf("bench: expert hits %llu, misses %llu, skipped %llu; prefetch issued %llu, used %llu, wasted %llu\n",
+        std::printf("bench: expert hits %llu, misses %llu, skipped %llu (%llu with no slot left); prefetch issued %llu, used %llu, wasted %llu\n",
                     (unsigned long long) (s1.expert_hits - s0.expert_hits),
                     (unsigned long long) (s1.expert_misses - s0.expert_misses),
                     (unsigned long long) (s1.expert_skips - s0.expert_skips),
+                    (unsigned long long) (s1.expert_forced_skips - s0.expert_forced_skips),
                     (unsigned long long) (s1.prefetch_issued - s0.prefetch_issued),
                     (unsigned long long) (s1.prefetch_used - s0.prefetch_used),
                     (unsigned long long) (s1.prefetch_wasted - s0.prefetch_wasted));
@@ -594,6 +597,7 @@ int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t
 }  // namespace
 
 int main(int argc, char** argv) {
+    bool chunk_given = false;
     strata::core::NemoOptions o;
     bool serve = false;
     const char* ppl = nullptr;
@@ -614,8 +618,9 @@ int main(int argc, char** argv) {
         if (a == "--gguf") o.gguf = next();
         else if (a == "--experts-gguf") o.experts_gguf = next();
         else if (a == "--max-context") { o.max_context = std::atoll(next()); ctx_given = true; }
-        else if (a == "--chunk") o.chunk = std::atoll(next());
+        else if (a == "--chunk") { o.chunk = std::atoll(next()); chunk_given = true; }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(next());
+        else if (a == "--vram-limit-mib") o.vram_limit_mib = std::atoll(next());
         else if (a == "--expert-slots") o.expert_slots = std::atoll(next());
         else if (a == "--kv-base") o.kv_base = std::atoll(next());
         else if (a == "--serve") serve = true;
@@ -647,10 +652,28 @@ int main(int argc, char** argv) {
     }
     if (o.gguf.empty() || (!serve && !ppl && !bench)) {
         std::fprintf(stderr, "usage: %s --gguf FILE [--max-context N] [--chunk N] [--vram-reserve-mib N] "
-                             "[--expert-slots N] (--serve | --ppl IDS [--ctx N] [--chunks N] | --bench IDS [--ctx N] [--gen N])\n", argv[0]);
+                             "[--expert-slots N] [--vram-limit-mib N] (--serve | --ppl IDS [--ctx N] [--chunks N] | --bench IDS [--ctx N] [--gen N])\n", argv[0]);
         return 2;
     }
     if ((ppl || bench) && !ctx_given) o.max_context = std::max<int64_t>(ctx + gen, 1024);
+    {
+        // a card (or --vram-limit-mib) under 20 GiB: the small-card profile, unless set by hand - an 8192-row chunk
+        // and a ring of 48 expert blobs for the prompt (~140 MiB; 384: ~1.1 GiB).  At 15,800 MiB with MTP that leaves
+        // 40 expert slots a layer: prefill 4,600 tok/s at 32K (2,000 with a 2048-row chunk and 48 slots), decode the
+        // same.  Use the precise decode (--prefetch 1): with few slots the fast one costs PPL x1.17
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        const int64_t card = o.vram_limit_mib > 0 ? o.vram_limit_mib : (int64_t) (tot >> 20);
+        if (card < 20480) {
+            if (!chunk_given) o.chunk = 8192;
+            if (!std::getenv("STRATA_NEMO_RING")) setenv("STRATA_NEMO_RING", "48", 1);
+            std::fprintf(stderr, "strata-nemotron: a %lld MiB card: the small-card profile (chunk %lld, prompt ring %s)\n",
+                         (long long) card, (long long) o.chunk, std::getenv("STRATA_NEMO_RING"));
+            if (const char* pf = std::getenv("STRATA_NEMO_PREFETCH"); pf && std::atoi(pf) == 0)
+                std::fprintf(stderr, "strata-nemotron: --prefetch 0 on a small card skips most expert misses: decode PPL "
+                                     "x1.17 at 16 GB (x1.01 with --prefetch 1)\n");
+        }
+    }
     strata::core::NemoModel m;
     std::string err;
     const auto t0 = Clock::now();

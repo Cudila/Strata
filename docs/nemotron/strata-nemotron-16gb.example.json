@@ -1,0 +1,47 @@
+{
+  "exe": "build/strata-nemotron",
+  "args": [
+    "--gguf",
+    "models/Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf",
+    "--max-context",
+    "262144",
+    "--vram-reserve-mib",
+    "512",
+    "--spec",
+    "5",
+    "--spec-min-p",
+    "0.8",
+    "--skip-w",
+    "0.4",
+    "--tail-skip",
+    "0",
+    "--prefetch",
+    "1",
+    "--evict",
+    "lfu",
+    "--prompt-skip-w",
+    "0.3",
+    "--prompt-skip-max",
+    "8192",
+    "--kv-base",
+    "65536"
+  ],
+  "cwd": ".",
+  "tokenizer": "models/tokenizer",
+  "model_name": "nemotron-3.5-super",
+  "log": "strata-nemotron-16gb.log",
+  "port": 10061,
+  "gpu": 0,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
+    "min_p": 0.0
+  },
+  "vision": {
+    "exe": "build-vision/bin/strata-vision",
+    "mmproj": "models/mmproj-BF16.gguf",
+    "model": "models/Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf",
+    "gpu": false
+  }
+}

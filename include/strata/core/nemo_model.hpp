@@ -35,6 +35,8 @@ struct NemoOptions {
     int64_t chunk = 2048;             ///< prompt tokens per forward pass
     int64_t vram_reserve_mib = 1536;  ///< left free after the expert cache is sized
     int64_t expert_slots = 0;         ///< per MoE layer; 0 = fill the card
+    /// at most this much VRAM for the process, its CUDA context included (0: the card): a smaller card, or its emulation
+    int64_t vram_limit_mib = 0;
     /// K/V cells a sequence starts with; past them the cache grows in pages of 65,536 cells, each taking its VRAM
     /// from the expert cache (and giving it back at the next reset), up to max_context
     int64_t kv_base = 262144;
@@ -43,6 +45,7 @@ struct NemoOptions {
 
 struct NemoStats {
     uint64_t expert_hits = 0, expert_misses = 0, expert_skips = 0;
+    uint64_t expert_forced_skips = 0;   ///< of the skips: misses with no slot left in their pass (small cards)
     uint64_t prefetch_issued = 0, prefetch_used = 0, prefetch_wasted = 0;
     uint64_t spec_windows = 0, spec_drafted = 0, spec_accepted = 0;
     int64_t slots_per_layer = 0;
