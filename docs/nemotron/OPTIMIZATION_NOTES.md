@@ -220,3 +220,27 @@ which is ~2,200 experts/s or 0.45 ms per expert.
 **A small VRAM cache** (`--expert-slots N` on the 32 GB card, prefetch off, skip 0.4): 140 / 48 / 24 slots gave decode
 PPL 2.4357 / 2.6425 / 2.8442. With a small cache, skipping removes even more of the routing. A 16 GB card needs exact
 miss handling (CPU lane, SSD tier), not more skipping.
+
+**Skipping relu²'s zeros inside today's decode kernel: exact, but no faster** (tried 2026-10-19, reverted). The
+NVFP4 GEMV of `down_proj` flagged the input's all-zero 16-value sub-blocks in shared memory. It loaded and computed
+only the others, and skipped a 64-value block outright when all four were zero.
+
+Results:
+- PPL and the generated ids are identical, as they must be;
+- decode 89.8–90.0 tok/s without, 89.6–90.8 with;
+- the profile's "experts (compute)" 1519 ms without, 1525–1543 ms with, per 512 tokens.
+
+The kernel is bound by memory, not arithmetic. A zero sub-block is 8 bytes inside a 36-byte block, and DRAM is read
+in 32-byte sectors. A sector is spared only when everything in it is zero, which is about the 5.9% all-zero 64-blocks.
+
+What would cut the bytes: a column layout of `down_proj`, bit-exact (the same codes and scales, permuted):
+- each input value's 1024 codes contiguous (512 bytes);
+- each 16-value block's 1024 scales contiguous (1 KB);
+- a nonzero input reads 512 bytes, a block with any nonzero value reads its 1 KB of scales;
+- at 92% zeros and 34% all-zero blocks that is ~223 KB per expert row-set against 1.55 MB: −84% for `down`, −42% for
+  an expert;
+- with the experts at ~27% of decode time, the ceiling is ~10–12% decode.
+
+The catch: the prompt path's FP4 GEMM reads the VRAM slots in ggml layout. A column layout needs either a GEMM loader
+for it or a repack per group on the prompt path, which costs short prompts. It pays more for misses (PCIe / SSD):
+once `up` is computed, only the nonzero columns of `down` need to be copied.

@@ -24,8 +24,8 @@ desktop. Greedy, 256 generated tokens on wikitext-2:
 | 512K | 5 075 | 107 | 65 |
 | 1M | 3 125 (335 s) | 111 | 47 |
 
-Decode here is the **fast** mode (`--skip-w 0.4 --prefetch 0`: low-weight cache misses are skipped, decode PPL ×1.091
-against no skipping). The **precise** mode (`--prefetch 1`, ×1.008, the example config's setting) decodes at 88 / 130 / 85 /
+Decode here is the **fast** mode (`--skip-w 0.4 --prefetch 0`, the example config's setting: low-weight cache misses are skipped, decode PPL ×1.091
+against no skipping). The **precise** mode (`--prefetch 1`, ×1.008) decodes at 88 / 130 / 85 /
 85 / 69 / 80 tok/s with MTP and 52 / 52 / 50 / 44 / 41 / 31 without, at 4K / 32K / 128K / 256K / 512K / 1M.
 
 ![Speed of every request the v3 engine served through llama-swap](media/nemotron-speed-histogram.png)

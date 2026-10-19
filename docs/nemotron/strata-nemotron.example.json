@@ -18,7 +18,7 @@
     "--tail-skip",
     "0",
     "--prefetch",
-    "1",
+    "0",
     "--evict",
     "lfu",
     "--prompt-skip-w",

@@ -164,7 +164,7 @@ The engine on its own:
 ```sh
 ./build/strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf \
     --max-context 1048576 --kv-base 65536 --chunk 16384 --vram-reserve-mib 1024 \
-    --spec 5 --spec-min-p 0.8 --skip-w 0.4 --tail-skip 0 --prefetch 1 --evict lfu \
+    --spec 5 --spec-min-p 0.8 --skip-w 0.4 --tail-skip 0 --prefetch 0 --evict lfu \
     --prompt-skip-w 0.3 --prompt-skip-max 8192 --serve
 ```
 
