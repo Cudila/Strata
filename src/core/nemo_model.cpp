@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -591,6 +592,11 @@ struct NemoModel::Impl {
     int64_t tail_skip = std::getenv("STRATA_NEMO_TAIL_SKIP") ? std::atoll(std::getenv("STRATA_NEMO_TAIL_SKIP")) : 0;
     int64_t topk_cut = std::getenv("STRATA_NEMO_TOPK_CUT") ? std::atoll(std::getenv("STRATA_NEMO_TOPK_CUT")) : 0;
     FILE* route_trace = std::getenv("STRATA_NEMO_ROUTE_TRACE") ? fopen(std::getenv("STRATA_NEMO_ROUTE_TRACE"), "ab") : nullptr;
+    // STRATA_NEMO_ZERO_STATS=1 (research): per MoE layer, the experts' relu^2 hidden values in decode / verify windows -
+    // rows, values, exact zeros, all-zero blocks of 16 and of 64 (NVFP4's scale block, ggml's superblock); printed at exit
+    bool zero_stats = std::getenv("STRATA_NEMO_ZERO_STATS") != nullptr;
+    std::vector<std::array<uint64_t, 5>> zs;
+    std::vector<float> zs_host;
     double prof_ms[9] = {0};
     uint64_t prof_tokens = 0;
     std::chrono::steady_clock::time_point prof_t;
@@ -792,6 +798,23 @@ NemoModel::NemoModel() : impl_(new Impl) {}
 
 NemoModel::~NemoModel() {
     if (!impl_) return;
+    if (impl_->zero_stats && !impl_->zs.empty()) {
+        const int64_t FF = g_.n_ff_exp;
+        std::array<uint64_t, 5> all{};
+        std::fprintf(stderr, "zero stats (relu^2 hidden of the experts, decode): moe layer, rows, zero values %%, "
+                             "zero 16-blocks %%, zero 64-blocks %%\n");
+        for (size_t l = 0; l < impl_->zs.size(); ++l) {
+            const auto& z = impl_->zs[l];
+            for (int k = 0; k < 5; ++k) all[(size_t) k] += z[(size_t) k];
+            if (!z[0]) continue;
+            std::fprintf(stderr, "  %2zu %8llu %6.2f %6.2f %6.2f\n", l, (unsigned long long) z[0], 100.0 * z[2] / z[1],
+                         100.0 * z[3] / (z[0] * ((FF + 15) / 16)), 100.0 * z[4] / (z[0] * (FF / 64)));
+        }
+        if (all[0])
+            std::fprintf(stderr, "  all %llu rows: zero values %.2f%%, zero 16-blocks %.2f%%, zero 64-blocks %.2f%%\n",
+                         (unsigned long long) all[0], 100.0 * all[2] / all[1], 100.0 * all[3] / (all[0] * ((FF + 15) / 16)),
+                         100.0 * all[4] / (all[0] * (FF / 64)));
+    }
     for (void* p : impl_->allocs) cudaFree(p);
     for (KvPages* l : impl_->kv_lists)
         for (size_t i = 0; i < l->k.size(); ++i) { cudaFree(l->k[i]); cudaFree(l->ks[i]); cudaFree(l->v[i]); }
@@ -1718,6 +1741,30 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                                                            L, FF, st);
                     if (T == 1) strata::kernels::nemo_experts_sum(I.w, I.eh, I.routed, K, L, FF, st);
                     else strata::kernels::nemo_weighted_rows(I.eh + (size_t) KT * FF, I.w, I.routed, T, K, L, st);
+                    if (I.zero_stats) {
+                        if (I.zs.size() < I.ex.size()) I.zs.resize(I.ex.size(), std::array<uint64_t, 5>{});
+                        I.zs_host.resize((size_t) KT * FF);
+                        NCK(cudaMemcpyAsync(I.zs_host.data(), I.eh, (size_t) KT * FF * sizeof(float), cudaMemcpyDeviceToHost, st));
+                        NCK(cudaStreamSynchronize(st));
+                        std::array<uint64_t, 5>& z = I.zs[(size_t) b.moe];
+                        for (int64_t i = 0; i < KT; ++i) {
+                            if (skip_of[(size_t) where[(size_t) h_ids[(size_t) i]]]) continue;   // a zero expert
+                            const float* hrow = I.zs_host.data() + (size_t) i * FF;
+                            ++z[0];
+                            z[1] += (uint64_t) FF;
+                            for (int64_t j = 0; j < FF; ++j) z[2] += hrow[j] == 0.0f;
+                            for (int64_t j0 = 0; j0 < FF; j0 += 16) {
+                                bool zero = true;
+                                for (int64_t j = j0; j < j0 + 16 && zero; ++j) zero = hrow[j] == 0.0f;
+                                z[3] += zero;
+                            }
+                            for (int64_t j0 = 0; j0 + 64 <= FF; j0 += 64) {
+                                bool zero = true;
+                                for (int64_t j = j0; j < j0 + 64 && zero; ++j) zero = hrow[j] == 0.0f;
+                                z[4] += zero;
+                            }
+                        }
+                    }
                     I.ht[2] = std::chrono::steady_clock::now();
                     I.hms[0] += std::chrono::duration<double, std::micro>(I.ht[1] - I.ht[0]).count();
                     I.hms[1] += std::chrono::duration<double, std::micro>(I.ht[2] - I.ht[1]).count();

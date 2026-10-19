@@ -24,6 +24,10 @@ desktop. Greedy, 256 generated tokens on wikitext-2:
 | 512K | 5 075 | 107 | 65 |
 | 1M | 3 125 (335 s) | 111 | 47 |
 
+Decode here is the **fast** mode (`--skip-w 0.4 --prefetch 0`: low-weight cache misses are skipped, decode PPL ×1.091
+against no skipping). The **precise** mode (`--prefetch 1`, ×1.008, the example config's setting) decodes at 88 / 130 / 85 /
+85 / 69 / 80 tok/s with MTP and 52 / 52 / 50 / 44 / 41 / 31 without, at 4K / 32K / 128K / 256K / 512K / 1M.
+
 ![Speed of every request the v3 engine served through llama-swap](media/nemotron-speed-histogram.png)
 
 *All 363 requests the v3 engine served through llama-swap (everyday chat plus tool-call, image and needle tests up to 1M): generation
@@ -55,8 +59,9 @@ Quality:
   tensor cores, W8A8 at ~390 TOP/s.
 - **Expert copies overlap compute.** Misses stream on their own stream into a ring of slots while the hits compute.
   The next MoE layer is planned ahead. The cache is LFU with decay.
-- **Skipping misses by router weight.** A missed expert whose weight is below τ in every row is not fetched. It costs
-  ×1.005 PPL, and short prompts become ~8× faster. They are bound by PCIe, not compute.
+- **Skipping misses by router weight.** A missed expert whose weight is below τ in every row is not fetched. In decode
+  this costs ×1.008 PPL with the prefetch on (precise mode) and ×1.091 with it off (fast mode). In short prompts
+  (`--prompt-skip-w`) it costs ×1.005 and makes them ~8× faster: they are bound by PCIe, not compute.
 - **Mamba-2.** Chunked SSD in FP32 for prompts. A sequential scan for MTP verify windows, bit-identical to the decode
   step, so drafts can be rolled back exactly.
 - **Attention.** int8 K and FP16 V in a paged cache. Q·K is int8 mma and P·V is FP16 mma. Split-K in decode reads each

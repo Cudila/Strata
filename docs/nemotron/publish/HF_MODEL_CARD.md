@@ -19,7 +19,7 @@ license_link: https://openmdw.ai/license/1-1/
 
 # Nemotron-3.5-Super-120B-A12B — NVFP4 + Strata engine for one RTX 50-series card
 
-### **186 t/s decode and 9,575 t/s prefill at 32K** on one RTX 5090 with the experts in RAM: 6× llama.cpp's decode on the same weights, with NVIDIA's own NVFP4 experts and the MTP head kept.
+### **186 t/s decode and 9,610 t/s prefill at 32K** on one RTX 5090 with the experts in RAM (130 t/s in the precise decode mode): 6× llama.cpp's decode on the same weights, with NVIDIA's own NVFP4 experts and the MTP head kept.
 
 > **Blackwell only: RTX 50-series (sm_120).** Every optimization of the engine is built on Blackwell's FP4 tensor-core
 > instructions (`mma … kind::mxf4nvf4.block_scale`, NVFP4 × NVFP4 with its native scales), which no earlier
@@ -41,41 +41,57 @@ made for [strata-nemotron](https://github.com/Cudila/Strata). That is a fork of 
 pinned RAM, a VRAM cache in front of them, and every NVFP4 GEMM of the prompt on Blackwell's FP4 tensor cores.
 
 The routed experts are NVIDIA's NVFP4 values, bit for bit, repacked to ggml's `NVFP4` without loss. The 1.6 GB
-multi-token-prediction (MTP) block is kept: it is what takes decode from ~100 to ~186 t/s. The vision tower is not
+multi-token-prediction (MTP) block is kept: it takes decode at 32K from 109 to 186 t/s (fast mode) and from 52 to 130 t/s (precise). The vision tower is not
 in this file: it is Unsloth's mmproj (see *Images*).
 
 ## Performance
 
-| Metric | strata-nemotron, MTP on | strata-nemotron, MTP off | llama.cpp, same weights* |
-| :----- | :---------------------: | :----------------------: | :----------------------: |
-| **Decode, 4K prompt** | **118 t/s** | 96 t/s | 19.4 t/s |
-| **Decode, 32K prompt** | **186 t/s** | 109 t/s | — |
-| **Decode, 128K prompt** | **165 t/s** | 95 t/s | — |
-| **Decode, 256K prompt** | 138 t/s | 79 t/s | — |
-| **Decode, 512K prompt** | 107 t/s | 65 t/s | — |
-| **Decode, 1M prompt** | **111 t/s** | 47 t/s | — |
-| **Prefill, 4K** | 2,277 t/s | 2,447 t/s | ~30–40 t/s (short prompts) |
-| **Prefill, 32K** | **9,575 t/s** | 9,521 t/s | — |
-| **Prefill, 128K** | 9,132 t/s | 9,059 t/s | — |
-| **Prefill, 256K** | 7,336 t/s | 7,301 t/s | — |
-| **Prefill, 512K** | 5,075 t/s | 5,013 t/s | — |
-| **Prefill, 1M** | 3,125 t/s (335 s) | 3,124 t/s | — |
-| **25 test prompts, end to end** | **19 s** | — | 220 s |
-| **Context** | 1,048,576 | 1,048,576 | — |
+strata-nemotron has two decode modes. They differ only in what happens to a cache miss whose routing weight is low:
+- **fast** (`--skip-w 0.4 --prefetch 0`): the miss is skipped;
+- **precise** (`--skip-w 0.4 --prefetch 1`): the next layer's likely experts are prefetched, so far fewer misses are
+  skipped.
+
+Prefill is the same in both.
+
+| Decode | MTP on, fast | MTP on, precise | MTP off, fast | MTP off, precise | llama.cpp, same weights* |
+| :----- | :---: | :---: | :---: | :---: | :---: |
+| **4K prompt** | 118 t/s | 88 t/s | 96 t/s | 52 t/s | 19.4 t/s |
+| **32K prompt** | **186 t/s** | **130 t/s** | 109 t/s | 52 t/s | — |
+| **128K prompt** | 165 t/s | 85 t/s | 95 t/s | 50 t/s | — |
+| **256K prompt** | 138 t/s | 85 t/s | 79 t/s | 44 t/s | — |
+| **512K prompt** | 107 t/s | 69 t/s | 65 t/s | 41 t/s | — |
+| **1M prompt** | 111 t/s | 80 t/s | 47 t/s | 31 t/s | — |
+| **decode PPL against no skipping** | ×1.091 | ×1.008 | ×1.091 | ×1.008 | — |
+
+| Prefill | MTP on | MTP off | llama.cpp, same weights* |
+| :----- | :---: | :---: | :---: |
+| **4K** | 2,368 t/s | 2,295 t/s | ~30–40 t/s (short prompts) |
+| **32K** | **9,610 t/s** | 9,390 t/s | — |
+| **128K** | 8,894 t/s | 9,047 t/s | — |
+| **256K** | 7,313 t/s | 7,339 t/s | — |
+| **512K** | 5,094 t/s | 5,095 t/s | — |
+| **1M** | 3,090 t/s (339 s) | 3,142 t/s | — |
+
+| | strata-nemotron | llama.cpp, same weights* |
+| :--- | :---: | :---: |
+| **25 test prompts, model loaded** | 19 s fast, 30 s precise | — |
+| **the same, including the load** | 93 s (precise, with the vision encoder) | 220 s |
+| **Context** | 1,048,576 | — |
 
 \* llama.cpp cannot load NVFP4 inside the MTP block, so it ran an MTP-free variant of this file
 (`convert.py --no-mtp`) with `--fit on`.
 
-Greedy, 256 generated tokens on wikitext-2 (test + train for the 256K–1M rows; "1M" is 1,047,552 prompt tokens, the window minus 1K), one process per row, so the expert cache starts cold. At 1M the K/V (~6.5 GiB) has taken 56 slots a layer from the expert cache, which is why MTP matters most there: 2.3× decode. MTP is 5 drafts with
-a 0.8 probability cut-off, and the "tokens a window" figures are 1.94 / 3.06 / 2.99 / 2.99 / 2.35 / 3.84 at 4K / 32K / 128K / 256K / 512K / 1M. In chat
-(temperature 1.0) decode with MTP runs at 155–209 t/s.
+Greedy, 256 generated tokens on wikitext-2 (test + train for the 256K–1M rows; "1M" is 1,047,552 prompt tokens, the window minus 1K), one process per row, so the expert cache starts cold. At 1M the K/V (~6.5 GiB) has taken 56 slots a layer from the expert cache, which is why MTP matters most there: 2.4× decode (fast), 2.6× (precise). MTP is 5 drafts with
+a 0.8 probability cut-off, and the "tokens a window" figures in the precise mode are 2.23 / 3.56 / 2.05 / 2.56 / 2.21 / 3.76 at 4K / 32K / 128K / 256K /
+512K / 1M. The decode PPL is `--ppl-decode` on wikitext-2 (4 × 1024), against the same engine with no skipping.
 
 ![Speed of every request strata-nemotron v3 served through llama-swap: prompt and generation histograms](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell/resolve/main/assets/nemotron-speed-histogram.png)
 
-*Real use, not a benchmark:* all 363 requests the v3 engine served through llama-swap on the machine of *Tested
-hardware* (everyday chat plus the checks in this card: tool calls, images, the 512K–1M needle tests), with MTP and the sampling the clients asked
-for. Generation is 181 · 229 · 247 t/s (p50 · p95 · p99) and never below 106 t/s; prompt is 1,257 t/s at p50, because
-most requests are short follow-ups whose prompt is a few hundred tokens, and 9,169 t/s at p95.
+*Real use, not a benchmark:* all 363 requests the v3 engine served through llama-swap in the **fast** decode mode, on
+the machine of *Tested hardware* (everyday chat plus the checks in this card: tool calls, images, the 512K–1M needle
+tests), with MTP and the sampling the clients asked for. Generation is 181 · 229 · 247 t/s (p50 · p95 · p99) and never
+below 106 t/s. Prompt is 1,257 t/s at p50, because most requests are short follow-ups whose prompt is a few hundred
+tokens, and 9,169 t/s at p95.
 
 The fastest prompts in the histogram, through the server:
 - 15.6K tokens: 11,397 t/s;
@@ -111,11 +127,14 @@ These dense layers are ~6% of the weights, yet putting all of them in NVFP4 cost
 all the experts. `lm_head` (+1.3% PPL) and Mamba `in_proj` (+0.9%) are the expensive ones. This file takes the middle
 row: 2 GiB less VRAM than Q8_0 everywhere, which is ~700 more experts in the cache.
 
-strata-nemotron's fast prompt path adds about ×1.008 PPL on top of this: ×1.003 for FP4 activations, ×1.004–1.005 for
-int8 attention. Decode does not use it, and speculative greedy is bit-identical to plain greedy (300/300 tokens).
+strata-nemotron's prompt path adds about ×1.008 PPL on top of this: ×1.003 for FP4 activations, ×1.004–1.005 for int8
+attention. Decode adds ×1.008 in the precise mode and ×1.091 in the fast one (see *Performance*). Speculative greedy is
+bit-identical to plain greedy (300/300 tokens).
 
 End to end, 25 prompts went through the OpenAI API (facts, arithmetic, code, SQL, bash, RU/EN translation, formulas;
-greedy). strata-nemotron and llama.cpp each got **25/25** correct, and 21 of the 25 answers were byte-identical.
+greedy). strata-nemotron (fast mode) and llama.cpp each got **25/25** correct, and 21 of the 25 answers were
+byte-identical. In the precise mode: 25/25 in two of three runs, 24/25 in one (a reasoning trace ran past the
+1,024-token limit).
 
 ## Parameters
 
@@ -145,7 +164,7 @@ The engine on its own:
 ```sh
 ./build/strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf \
     --max-context 1048576 --kv-base 65536 --chunk 16384 --vram-reserve-mib 1024 \
-    --spec 5 --spec-min-p 0.8 --skip-w 0.4 --tail-skip 0 --prefetch 0 --evict lfu \
+    --spec 5 --spec-min-p 0.8 --skip-w 0.4 --tail-skip 0 --prefetch 1 --evict lfu \
     --prompt-skip-w 0.3 --prompt-skip-max 8192 --serve
 ```
 
@@ -195,9 +214,10 @@ Notes that cost time if you miss them:
 * **Give the desktop its VRAM.** If the card also drives your screen, keep `--vram-reserve-mib 1024` or more. A
   compositor or a screen-sharing portal that runs out of VRAM loses its buffers, and a remote-desktop session can
   lose its capture permission with them.
-* **`--skip-w 0.4` and `--prompt-skip-w 0.3` are part of the speed.** A cache miss whose routing weight is below the
-  threshold is skipped instead of copied over PCIe. Each costs ×1.005 PPL. `--skip-w` takes decode with MTP from
-  ~136 to ~180 t/s, and `--prompt-skip-w` takes a 128-token prompt from 0.7 s to 85 ms.
+* **`--skip-w 0.4`, `--prefetch` and `--prompt-skip-w 0.3` are part of the speed.** A cache miss whose routing weight
+  is below the threshold is skipped instead of copied over PCIe. `--prefetch 1` copies the next layer's likely experts
+  ahead of time, so far fewer are skipped: precise decode, ×1.008 PPL. `--prefetch 0` is the fast mode, ×1.091.
+  Without skipping at all, decode runs at 43 t/s. `--prompt-skip-w` takes a 128-token prompt from 0.7 s to 85 ms.
 * **Loading takes 35–45 s.** The 59 GiB of experts are copied into page-locked RAM once, from the page cache if the
   file is in it. Pageable memory would put every PCIe copy through the driver's staging at a fraction of the speed.
 * **The KV grows into the expert cache.** Up to `--kv-base` (64K) it is fixed. Beyond that, each 64K page takes
@@ -237,15 +257,16 @@ What decides whether this runs is where its parts live:
 | VRAM | example cards | expert slots a layer | result |
 | ---: | :--- | ---: | :--- |
 | 32 GB | 5090 | 140 | **measured**: the tables above |
-| 24 GB | 5090 Laptop | 72 | **emulated** on the 5090 by leaving the engine 24 GB: prefill 4K 2,382 t/s, 32K 9,153 t/s; decode 121 / 198 t/s at 4K / 32K. Within a few % of the 32 GB row. The 1M context will not fit: its KV takes 56 slots, leaving fewer than 22 |
+| 24 GB | 5090 Laptop | 72 | **emulated** on the 5090 by leaving the engine 24 GB: prefill 4K 2,328–2,382 t/s, 32K 9,040–9,153 t/s; decode at 4K / 32K 121 / 198 t/s fast (as the 32 GB row), 64 / 93 t/s precise (−27% against the 32 GB row). The 1M context will not fit: its KV takes 56 slots, leaving fewer than 22 |
 | 16 GB | 5080, 5070 Ti, 5060 Ti 16G | 13 | **does not start yet**, emulated the same way: the engine needs 22 slots a layer, one token's experts. **In development**, with 64 GB of RAM: cold experts on the SSD |
 | 12 GB and below | 5070, 5060 | — | does not start |
 
 The 24 GB row was emulated with `--vram-reserve-mib` on the same card. So it shows what a smaller cache costs, not
 what a laptop GPU's lower compute and power limit cost: read it as an upper bound.
 
-That a half-size cache is nearly free is not a fluke. With skipping by routing weight, the misses that remain are
-mostly experts whose weight is too small to matter, and long prompts are bound by compute.
+In the fast mode a half-size cache is nearly free: the misses it adds are mostly experts whose weight is below the
+skip threshold, and long prompts are bound by compute. In the precise mode those misses are copied, so decode drops
+by ~27%.
 
 **RAM:**
 - The page-locked expert arena is 59 GiB and cannot be swapped.

@@ -165,3 +165,58 @@ path gives ~800 on the real shapes. A model that already ships in NVFP4 should r
 - TF32 for the router: ΔNLL +0.002 and no speed gain.
 - A 32K chunk for long prompts: half the copies per token, but the same time (±1%).
 - Gathering latent rows inside the expert GEMM instead of quantizing per expert: the GEMM eats the quantization gain.
+
+## 5. Decode: skipping misses, quality against speed (2026-10-19)
+
+Measured with the decode path (`--ppl-decode`, wikitext, 4 × 1024, PPL against no skipping at all). The slot runs
+`--skip-w 0.4 --prefetch 1`:
+
+| setting | decode PPL | × | decode with MTP at 4K, tok/s | routings skipped |
+|---|---:|---:|---:|---:|
+| no skipping (`--skip-w 0`) | 2.2428 | 1 | 43 | 0 |
+| `--skip-w 0.1`, prefetch off | 2.2484 | 1.003 | 45 | |
+| `--skip-w 0.2`, prefetch off | 2.2820 | 1.017 | 73 | |
+| `--skip-w 0.3`, prefetch off | 2.3465 | 1.046 | 113 | |
+| `--skip-w 0.4`, prefetch off | 2.4459 | **1.091** | 129 | 37% |
+| **`--skip-w 0.4`, prefetch on (the slot)** | 2.2611 | **1.008** | 85 | 10% |
+| `--skip-w 0.2`, prefetch on | 2.2573 | 1.006 | 64 | |
+
+Why the threshold bites: the router's weights are normalized and then multiplied by 5, so a token's 22 weights average
+~0.23. A threshold of 0.4 is above the average, and without the prefetch a non-resident expert below it is simply
+dropped: 37% of all routings. Giving the dropped weight to the kept experts (renormalizing) makes it worse: 2.4150 at
+0.3, 2.6427 at 0.4.
+
+The prompt path is not affected (its skipping is `--prompt-skip-w`, measured at ×1.005 on chunks ≤ 1024 rows).
+
+More decode speed has to come from exact methods: the CPU computing missed experts while the GPU works (Strata's CPU
+pool for swift15), and fewer bytes per miss (the sparse `down_proj` below, ROADMAP item 4).
+
+## 6. Research measurements (2026-10-19)
+
+**relu² zeros** (`STRATA_NEMO_ZERO_STATS=1`, decode path, 1.6M expert rows):
+- 92.1% of the hidden values after relu² are exactly zero (layers 85–99%);
+- only 33.7% of the 16-value blocks (NVFP4's scale block) are all zero, and 5.9% of the 64-value ggml superblocks;
+- so skipping whole blocks in today's layout saves about a third of `down_proj`'s reads. Reaching the 92% needs a
+  column layout of `down_proj`: the 4-bit codes of a hidden value's column contiguous, the scales of a block read
+  once for its 16 columns. Estimated ~84% less `down` traffic, bit-exact (the same codes and scales, read
+  differently). `up_proj` cannot be skipped: its input, the latent, is dense.
+
+**Routing skew** (`STRATA_NEMO_ROUTE_TRACE`, a 64K-token prompt + 512 decoded tokens, a static cache of the most
+used (layer, expert) pairs):
+
+| RAM cache | share of decode routings | share of prompt routings |
+|---:|---:|---:|
+| 16 GiB (27% of the experts) | 71% | 54% |
+| 24 GiB | 84% | 68% |
+| 32 GiB | 92% | 80% |
+| 40 GiB (68%) | 97% | 89% |
+
+9% of the experts were never used in decode on this text. This is one text and an ideal static cache, so mixed
+traffic will do worse.
+
+**NVMe** (XPG MARS 980 BLADE, random 3 MiB `O_DIRECT` reads of the GGUF): 5.5 GB/s at QD 1 and ~7.0 GB/s at QD 2–16,
+which is ~2,200 experts/s or 0.45 ms per expert.
+
+**A small VRAM cache** (`--expert-slots N` on the 32 GB card, prefetch off, skip 0.4): 140 / 48 / 24 slots gave decode
+PPL 2.4357 / 2.6425 / 2.8442. With a small cache, skipping removes even more of the routing. A 16 GB card needs exact
+miss handling (CPU lane, SSD tier), not more skipping.
