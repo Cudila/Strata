@@ -50,7 +50,10 @@ The plan:
 
 ### 4. relu² zeros out of the compute graph: sparse GEMM/GEMV
 
-After relu², most of an expert's hidden values are exactly zero: 92.5% according to an independent 8 GB-GPU port. The
+After relu², most of an expert's hidden values are exactly zero: 92.5% according to an independent 8 GB-GPU port
+(["Running NVIDIA's new 120B Nemotron-3.5-Super on an 8 GB GPU — skipping the zeros"](https://dev.to/helgard_orlm/running-nvidias-new-120b-nemotron-35-super-on-an-8-gb-gpu-skipping-the-zeros-and-finding-the-44o4), code:
+[helgard-orlm/nemotron-super-8gb](https://github.com/helgard-orlm/nemotron-super-8gb)). There the `down` weights were
+re-laid out on disk so that the zero neurons' rows are not read: decode went from 6.5 to 7.3–7.6 tok/s. The
 kernels pass over them quickly already, but they still read every column of `down_proj` and do the arithmetic.
 
 Questions:
