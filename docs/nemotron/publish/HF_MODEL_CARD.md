@@ -70,6 +70,13 @@ Greedy, 256 generated tokens on wikitext-2 (test + train for the 256K–1M rows;
 a 0.8 probability cut-off, and the "tokens a window" figures are 1.94 / 3.06 / 2.99 / 2.99 / 2.35 / 3.84 at 4K / 32K / 128K / 256K / 512K / 1M. In chat
 (temperature 1.0) decode with MTP runs at 155–209 t/s.
 
+![Speed of every request strata-nemotron v3 served through llama-swap: prompt and generation histograms](https://huggingface.co/Cudecnik/Nemotron-3.5-Super-120B-A12B-NVFP4-Strata-Blackwell/resolve/main/assets/nemotron-speed-histogram.png)
+
+*Real use, not a benchmark:* all 363 requests the v3 engine served through llama-swap on the machine of *Tested
+hardware* (everyday chat plus the checks in this card: tool calls, images, the 512K–1M needle tests), with MTP and the sampling the clients asked
+for. Generation is 181 · 229 · 247 t/s (p50 · p95 · p99) and never below 106 t/s; prompt is 1,257 t/s at p50, because
+most requests are short follow-ups whose prompt is a few hundred tokens, and 9,169 t/s at p95.
+
 With the cache warm (the second prompt in a row), prefill runs at:
 - 16K: 12,700 t/s;
 - 64K: 11,270 t/s;

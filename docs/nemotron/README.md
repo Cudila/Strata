@@ -24,6 +24,11 @@ desktop. Greedy, 256 generated tokens on wikitext-2:
 | 512K | 5 075 | 107 | 65 |
 | 1M | 3 125 (335 s) | 111 | 47 |
 
+![Speed of every request the v3 engine served through llama-swap](media/nemotron-speed-histogram.png)
+
+*All 363 requests the v3 engine served through llama-swap (everyday chat plus tool-call, image and needle tests up to 1M): generation
+181 · 229 · 247 t/s (p50 · p95 · p99), prompt 1,257 t/s at p50 and 9,169 at p95.*
+
 - With the expert cache warm: 16K prefills at 12 700 tok/s and 256K at 7 440 tok/s. A 1M-token prompt takes 340 s.
 - Needle-in-a-haystack at 32K–1M: 15/15 found.
 - In chat (temperature 1.0), decode with MTP runs at 155–209 tok/s.
