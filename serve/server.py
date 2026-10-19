@@ -3186,8 +3186,13 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # only a string that IS one token of this vocabulary stops a reply: Nemotron-H has no <|endoftext|>, and its
+        # pieces ('<', '|', ...) in the stop set ended every tool call at the '<' of '<function=' (strata-nemotron)
+        self.stop_ids = set()
+        for s in (IM_END, "<|endoftext|>"):
+            ids = tokenizer.encode(s, parse_special=True)
+            if len(ids) == 1:
+                self.stop_ids.update(ids)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
@@ -6872,7 +6877,9 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pre-tokenizer the pack declares (tools/strata_tokenizer.py extract writes it; qwen35 when absent)
+        tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")) if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, pre=tcfg.get("pre", "qwen35") if isinstance(tcfg, dict) else "qwen35")
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
