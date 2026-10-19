@@ -26,7 +26,7 @@ made for running on **one consumer GPU with the experts in system RAM**. The rou
 weights, repacked without loss. The 1.6 GB multi-token-prediction (MTP) block is kept. The vision tower is **not**
 included.
 
-It was built for [strata-nemotron](<FORK_URL>), a Nemotron-H fork of the [Strata](https://github.com/Niko1221/Strata)
+It was built for [strata-nemotron](https://github.com/Cudila/Strata), a Nemotron-H fork of the [Strata](https://github.com/Niko1221/Strata)
 engine. llama.cpp does not load it: llama.cpp cannot read NVFP4 tensors inside the MTP block.
 
 The file is named after its lowest-bit format, NVFP4, which holds over 90% of the bytes. It is split in two with
@@ -94,7 +94,7 @@ prompts, against 19 s for strata-nemotron.
 
 ## How to run
 
-**strata-nemotron** (CUDA, Blackwell sm_120 for the FP4 prompt path). Build and serve instructions: <FORK_URL>.
+**strata-nemotron** (CUDA, Blackwell sm_120 for the FP4 prompt path). Build and serve instructions: [https://github.com/Cudila/Strata](https://github.com/Cudila/Strata) (`docs/nemotron/README.md`).
 
 ```
 strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf --max-context 1048576 --chunk 16384 \
