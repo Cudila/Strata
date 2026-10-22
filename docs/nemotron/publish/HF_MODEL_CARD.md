@@ -108,6 +108,94 @@ Up to ~8K, a prompt is slower than you would expect from the 32K row. Top-22 of 
 expert of every layer even on a short prompt, so ~40 GB has to cross PCIe whatever the length. From 16K on, compute
 dominates.
 
+## Update 2026-10-22: agentic sessions
+
+The tables above are for one long prompt and a long answer. An agent session looks different: a prefix of 60K+
+tokens, then many turns of a few hundred new tokens each, sometimes with a request from another conversation in the
+middle, an edited earlier message, or a screenshot. This update is about those. **Decode speed did not change**: the
+decode rows above stand, and in the before/after runs below the difference was −2.6% at 6K, −1.9% at 32K and +0.9% at
+32K with temperature 1.0, against an 8–12% spread between identical runs.
+
+Time to first token, before and after, through the server (RTX 5090 of *Tested hardware*; temperature 0; one server
+run per arm, the arms ~15 minutes apart; short turns are the median of 2 repeats):
+
+| request | before | after |
+| :------ | -----: | ----: |
+| a 75K-token prefix, cold | 7,516 ms | 7,633 ms |
+| +30 new tokens on that prefix | 300 ms | **160 ms** (−47%) |
+| +100 new tokens | 353 ms | **186 ms** (−47%) |
+| +400 new tokens | 417 ms | **227 ms** (−46%) |
+| +1,500 new tokens | 537 ms | **350 ms** (−35%) |
+| +30 on an 81K session, right after a 4K-token request from another conversation | 7,803 ms | **204 ms** (−97%) |
+| the same 81K history, a different last message (+200 tokens) | 7,844 ms | **235 ms** (−97%) |
+| a 1920×1080 picture, cold (2 runs) | 1,347 / 1,024 ms | **1,058 / 774 ms** (−22% / −24%) |
+| a 2560×1440 picture, cold (2 runs) | 1,490 / 1,354 ms | **1,167 / 1,126 ms** (−22% / −17%) |
+| 1920×1080, second turn with the same picture (2 runs) | 843 / 836 ms | **495 / 479 ms** (−41% / −43%) |
+
+"Before" is the engine of the rest of this card (`--prompt-skip-w 0.3`, one saved state). "After" adds the options
+below. In the "after" run five experimental decode switches (environment variables, off by default, not part of the
+published setup) were also on; they showed no effect on decode, but the short-turn gain was not measured without them.
+The prefix of 75,474 tokens is generated text; "cold" pictures are pixel-edited copies, so each is encoded again.
+
+**What the conversation cache does.** A Mamba state cannot be rolled back, so the engine can continue a conversation
+only from a position whose state it saved. It used to save one state, at the last message boundary, in VRAM. Every turn
+therefore read the previous answer again (about 45 tokens of template and answer), and any other request, such as a
+title generator or a sub-agent, replaced the saved state, so the next turn read the whole 81K tokens again (7.8 s).
+Now the engine keeps up to N states in pinned RAM: at message boundaries, every 16K tokens of a long prompt, and right
+after each answer, so the next turn's prompt matches a saved position exactly.
+
+When another conversation arrives, the current one is *parked*: its K/V cells and its deepest saved states are copied
+to pinned RAM (60K tokens: 21–43 ms and 729–907 MiB), and copied back when a request extends it (60K: 17–18 ms).
+A branch from an earlier turn also finds its state. Resuming is bit-identical to the old single state (logit
+difference 0.0 on the same tokens). It costs RAM and a few ms on a warm request: the prompt step went from 31–35 ms to
+41–49 ms. Limits: when the answer is re-rendered differently from what was generated, the post-answer state does not
+match and each turn can park a copy, which the budget evicts oldest first; and a resume equals a cold read bit for bit
+only when the prompt is split into the same chunks. Details: `docs/nemotron/CONVERSATION_CACHE.md`.
+
+**New options** (all off unless given):
+
+| option | meaning |
+| :----- | :------ |
+| `--prompt-cache N` | up to N saved states of the current conversation (~165 MB of pinned RAM each, taken at load); the example config uses 8 |
+| `--prompt-cache-every M` | also save a state every M tokens of a long prompt (default 16384; a multiple of `--chunk`) |
+| `--conversation-cache-mib X` | pinned RAM for parked conversations; the example config uses 3000 |
+| `--prompt-skip-w 0.4` | was 0.3: the example config now skips low-weight misses of short prompts more aggressively (below) |
+
+The cache adds 8 × ~165 MB + 3000 MiB of page-locked RAM to the 59 GiB of experts.
+
+**`--prompt-skip-w` 0.3 → 0.4.** Short turns are bound by copying experts over PCIe, so each expert not copied saves
+time. Measured with the wikitext-2 test set (16 chunks of 1,024 tokens) for PPL, and the median of 3 short turns after a
+75K prefix for time (one server run per value; RAM and part of the GPU were shared with other jobs, so read the
+milliseconds as indicative):
+
+| `--prompt-skip-w` | PPL | against 0 | +30 tokens | +100 | +400 | +2,000 |
+| :---------------- | --: | --------: | ---------: | ---: | ---: | -----: |
+| 0 (off) | 3.0351 | ×1.000 | 1,106 ms | 1,208 | 1,293 | 1,316 |
+| 0.3 (before) | 3.0484 | ×1.004 | 289 ms | 326 | 402 | 596 |
+| **0.4 (now)** | **3.0728** | **×1.012** | **159 ms** | **181** | **220** | **434** |
+| 0.5 | 3.3015 | ×1.088 | 137 ms | 148 | 178 | 380 |
+| 0.6 | 4.1321 | ×1.361 | 129 ms | 138 | 156 | 354 |
+
+The rule: a change is taken when the time falls by a larger percentage than the PPL rises. 0.4 against 0.3 is −44…−45%
+of the time on 30–400 token turns (−27% at 2,000) for +0.8% PPL. 0.5 and 0.6 pass the same rule but cost ×1.088 and
+×1.361 here, so 0.4 stays. The PPL is measured on 1,024-token chunks, which is where this skipping acts; it is not a
+quality measure of a 75K-token session. Greedy texts of the old and the new build differ from each other no more than
+two runs of the same build do (the expert cache depends on history), and all of them were valid summaries of the same
+document.
+
+**Pictures.** Two changes in the encoder's CPU part, both exact on the pixels. The resize now runs on 14 threads (half the hardware threads of the test machine) and
+skips the axis whose length does not change (the `.sve` embedding files are byte-identical to the old build on the 5
+test pictures): the resize of a 1920×1080 picture went from 41 to 20 ms, a 2560×1440 one from 81 to 38 ms, and the whole
+encoder call (decode, resize, GPU encode, write) from 240 to 221 ms and from 469 to 424 ms. And WebP, TIFF and
+EXIF-rotated JPEG are now handed to the encoder as BMP instead of PNG (Pillow's PNG encode of a 1024×768 picture is
+about 13 ms; BMP takes 2–10 ms). The rest of the picture gain in the table is the same checkpoint effect as for text,
+plus `--prompt-skip-w`; the shares were not measured apart. A repeated picture is still encoded again on the next turn.
+Inside the server the encoder is slower than alone (246–431 ms at 1920×1080) because it shares the GPU with the engine.
+
+What was tried and left out, with numbers: `docs/nemotron/REVIEW_2026-10-22.md`. Among them: reading each expert once per
+verify window (same tokens, but slower: 3× the kernel launches), and a Q8_0 vision projector (−786 MiB of VRAM and 4–11%
+faster, but on 4 of 5 pictures the worst per-token cosine was 0.947–0.997, under the limit of 0.998).
+
 ## Quality
 
 | FP8 layers of the checkpoint stored as | dense, GiB | PPL / checkpoint | mean KL | top-1 |
@@ -128,7 +216,8 @@ all the experts. `lm_head` (+1.3% PPL) and Mamba `in_proj` (+0.9%) are the expen
 row: 2 GiB less VRAM than Q8_0 everywhere, which is ~700 more experts in the cache.
 
 strata-nemotron's prompt path adds about ×1.008 PPL on top of this: ×1.003 for FP4 activations, ×1.004–1.005 for int8
-attention. Decode adds ×1.008 in the precise mode and ×1.091 in the fast one (see *Performance*). Speculative greedy is
+attention. Short prompts (up to 8,192 rows) also skip low-weight cache misses (`--prompt-skip-w`): ×1.012 at 0.4 on
+1,024-token chunks, see the update above. Decode adds ×1.008 in the precise mode and ×1.091 in the fast one (see *Performance*). Speculative greedy is
 bit-identical to plain greedy (300/300 tokens).
 
 End to end, 25 prompts went through the OpenAI API (facts, arithmetic, code, SQL, bash, RU/EN translation, formulas;
@@ -165,8 +254,12 @@ The engine on its own:
 ./build/strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf \
     --max-context 1048576 --kv-base 65536 --chunk 16384 --vram-reserve-mib 1024 \
     --spec 5 --spec-min-p 0.8 --skip-w 0.4 --tail-skip 0 --prefetch 0 --evict lfu \
-    --prompt-skip-w 0.3 --prompt-skip-max 8192 --serve
+    --prompt-skip-w 0.4 --prompt-skip-max 8192 \
+    --prompt-cache 8 --conversation-cache-mib 3000 --serve
 ```
+
+The last two options are the conversation cache (see the update 2026-10-22); leave them out and the engine keeps one
+saved state, as before.
 
 With the OpenAI/Anthropic-compatible server (tool calls, reasoning, the chat template). Put both shards in
 `models/`, write the server's tokenizer folder from the GGUF once, then start it:
@@ -204,7 +297,7 @@ takes OpenAI `image_url` parts and Anthropic image blocks.
 | | |
 | :--- | :--- |
 | **tokens a picture** | 256–3,328: NVIDIA's dynamic tile, 1,024–13,312 patches of 16 px |
-| **encode time (GPU)** | 36 ms at 512 tokens, 238 ms at 2,040, 463 ms at 3,300 |
+| **encoder call** | decode, resize, GPU encode and write: 22 ms at 300 tokens, 221 ms at 2,040, 424 ms at 3,311 (before 2026-10-22: 240 and 469 ms at 2,040 and 3,311) |
 | **VRAM** | 2.9 GB for the encoder; the expert cache drops from 140 to 116 slots a layer |
 | **accuracy** | against a float32 transcription of NVIDIA's processor + RADIO + projector: rel err 0.003–0.009, per-token cosine ≥ 0.998 (`tools/nemotron/vision_check.py`) |
 | **follow-ups** | a turn after a picture reuses the state (2,061 of 2,107 tokens, 146 ms); a different picture of the same size is never reused |
@@ -214,10 +307,10 @@ Notes that cost time if you miss them:
 * **Give the desktop its VRAM.** If the card also drives your screen, keep `--vram-reserve-mib 1024` or more. A
   compositor or a screen-sharing portal that runs out of VRAM loses its buffers, and a remote-desktop session can
   lose its capture permission with them.
-* **`--skip-w 0.4`, `--prefetch` and `--prompt-skip-w 0.3` are part of the speed.** A cache miss whose routing weight
+* **`--skip-w 0.4`, `--prefetch` and `--prompt-skip-w 0.4` are part of the speed.** A cache miss whose routing weight
   is below the threshold is skipped instead of copied over PCIe. `--prefetch 1` copies the next layer's likely experts
   ahead of time, so far fewer are skipped: precise decode, ×1.008 PPL. `--prefetch 0` is the fast mode, ×1.091.
-  Without skipping at all, decode runs at 43 t/s. `--prompt-skip-w` takes a 128-token prompt from 0.7 s to 85 ms.
+  Without skipping at all, decode runs at 43 t/s. `--prompt-skip-w` takes a 128-token prompt from 0.7 s to 85 ms (measured with 0.3).
 * **Loading takes 35–45 s.** The 59 GiB of experts are copied into page-locked RAM once, from the page cache if the
   file is in it. Pageable memory would put every PCIe copy through the driver's staging at a fraction of the speed.
 * **The KV grows into the expert cache.** Up to `--kv-base` (64K) it is fixed. Beyond that, each 64K page takes
@@ -275,6 +368,7 @@ by ~27%.
 - The page-locked expert arena is 59 GiB and cannot be swapped.
 - The process peaked at 105 GiB resident on the 128 GB machine, but that includes the file's pages in the page cache,
   which the kernel can drop.
+- The conversation cache of the example config adds ~4.3 GB of page-locked RAM (8 × ~165 MB + 3000 MiB).
 - 96 GB is probably enough, but was not tried. 64 GB is not: the arena alone does not fit next to the system.
 
 ## Files
@@ -314,11 +408,15 @@ by ~27%.
 * Blackwell (sm_120) only: the engine's kernels use FP4 tensor-core instructions that earlier GPUs do not have.
 * One machine, one card (*Tested hardware*). The 24 GB row is an emulation; the smaller rows follow from the
   engine's own refusal message.
+* The update of 2026-10-22 is one server run per arm on one machine: the gains in the table are far larger than the
+  run-to-run spread we saw (8–12% in decode), but they are not confidence intervals.
 * PPL ×1.016 against the checkpoint is a wikitext mean. No downstream benchmarks were run beyond the 25-prompt check.
 * The reasoning modes, the chat template and the model's behaviour are NVIDIA's. This repo changes only how the
   weights are stored.
 
 ## Credits
+
+Engine, port and measurements: Cudila — https://github.com/Cudila/Strata (branch `strata-nemotron`).
 
 The base model is by [NVIDIA](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4). The engine
 is a fork of [Strata](https://github.com/Niko1221/Strata), and the conversion goes through

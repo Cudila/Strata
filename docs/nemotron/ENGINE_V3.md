@@ -123,13 +123,24 @@ The server reports the context as 1048576: `meta.n_ctx` in `/v1/models`, `n_ctx`
 
 `--kv-base N` (the initial KV), `--prompt-skip-w τ --prompt-skip-max N`, `--chunk 16384`.
 
+Added on 2026-10-22 (`CONVERSATION_CACHE.md`), all off by default:
+- `--prompt-cache N`: up to N live checkpoints of the current conversation (pinned, ~165 MB each);
+- `--prompt-cache-every M`: a checkpoint every M tokens of a long prompt (default 16384, 0 = none);
+- `--conversation-cache-mib X`: pinned RAM for parked conversations (X > 0 raises N to at least 2).
+
+`--prompt-skip-w` in the example config is 0.4 now (it was 0.3): `REVIEW_2026-10-22.md`, section 4.
+
 Environment variables for probes:
 - `STRATA_NEMO_FP4`: bits 1 dense, 2 experts' up, 4 down; 0 means BF16 + cuBLAS;
 - `STRATA_NEMO_RING`;
 - `STRATA_NEMO_ATTN_TC_KEYS`: the threshold for tensor-core attention in decode;
 - `STRATA_NEMO_SEQ_SCAN`;
 - `STRATA_NEMO_A4`: W4A4 emulation in the BF16 path;
-- `STRATA_NEMO_HOSTPROF`.
+- `STRATA_NEMO_HOSTPROF`;
+- decode experiments of 2026-10-22, all off and none of them faster by more than the run-to-run spread
+  (`REVIEW_2026-10-22.md`, section 3): `STRATA_NEMO_SHARED_EARLY`, `STRATA_NEMO_LFU_FAST` (and `STRATA_NEMO_LFU_CHECK`),
+  `STRATA_NEMO_MAMBA_SWAP`, `STRATA_NEMO_GPU_TOPK`, `STRATA_NEMO_MTP_EVENT`;
+- `STRATA_NEMO_DUMP_LOGITS=file`: appends the logits after each request's prompt (debugging the conversation cache).
 
 Tests, all PASS:
 - `nemo_fp4_parity`;

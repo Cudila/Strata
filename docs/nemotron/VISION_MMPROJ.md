@@ -113,7 +113,9 @@ Before the patch, the same document gave rel err 0.258 and min cos 0.32.
 | the same conversation with a mirrored chart | not reused, answered from the new picture |
 
 **Cost:**
-- Encoding on the GPU takes 36 ms (512 tokens) to 463 ms (3300 tokens).
+- One encoder call takes 36 ms (512 tokens) to 463 ms (3300 tokens). That is the whole call, `OK … ms` of
+  `strata-vision`: image decode, resize, preprocessing, the GPU encode and the file write, not only the GPU. Since
+  2026-10-22 (threaded resize) 1920×1080 takes 221 ms and 2560×1440 424 ms; the GPU part alone is ~181 and ~358 ms.
 - The encoder holds 2.9 GB of VRAM, so the engine gets 116 expert slots a layer instead of 140. The 24 GB emulation
   showed that half the cache costs only a few %.
 - Text after the change is identical: PPL 3.2120 on 8 × 1024, as before.

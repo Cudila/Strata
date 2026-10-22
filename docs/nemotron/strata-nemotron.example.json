@@ -22,11 +22,15 @@
     "--evict",
     "lfu",
     "--prompt-skip-w",
-    "0.3",
+    "0.4",
     "--prompt-skip-max",
     "8192",
     "--kv-base",
-    "65536"
+    "65536",
+    "--prompt-cache",
+    "8",
+    "--conversation-cache-mib",
+    "3000"
   ],
   "cwd": ".",
   "tokenizer": "models/tokenizer",

@@ -244,7 +244,7 @@ int run_ppl(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t c
 }
 
 int g_spec = 0;   ///< --spec N: drafts a window (serve), 0 = no speculation
-strata::core::ConversationCache g_cc;   ///< --prompt-cache N / --conversation-cache-mib X (docs/nemotron/CONV_CACHE.md)
+strata::core::ConversationCache g_cc;   ///< --prompt-cache N / --conversation-cache-mib X (docs/nemotron/CONVERSATION_CACHE.md)
 int64_t g_every = 16384;                ///< --prompt-cache-every M: a checkpoint every M tokens of a long read (0 = off)
 
 int run_serve(strata::core::NemoModel& m) {

@@ -169,7 +169,8 @@ path gives ~800 on the real shapes. A model that already ships in NVFP4 should r
 ## 5. Decode: skipping misses, quality against speed (2026-10-19)
 
 Measured with the decode path (`--ppl-decode`, wikitext, 4 × 1024, PPL against no skipping at all). The slot runs
-`--skip-w 0.4 --prefetch 1`:
+`--skip-w 0.4 --prefetch 1` (the precise mode; the production slot and the example config run the fast mode,
+`--skip-w 0.4 --prefetch 0`, the ×1.091 row):
 
 | setting | decode PPL | × | decode with MTP at 4K, tok/s | routings skipped |
 |---|---:|---:|---:|---:|
@@ -178,7 +179,7 @@ Measured with the decode path (`--ppl-decode`, wikitext, 4 × 1024, PPL against 
 | `--skip-w 0.2`, prefetch off | 2.2820 | 1.017 | 73 | |
 | `--skip-w 0.3`, prefetch off | 2.3465 | 1.046 | 113 | |
 | `--skip-w 0.4`, prefetch off | 2.4459 | **1.091** | 129 | 37% |
-| **`--skip-w 0.4`, prefetch on (the slot)** | 2.2611 | **1.008** | 85 | 10% |
+| **`--skip-w 0.4`, prefetch on (precise mode)** | 2.2611 | **1.008** | 85 | 10% |
 | `--skip-w 0.2`, prefetch on | 2.2573 | 1.006 | 64 | |
 
 Why the threshold bites: the router's weights are normalized and then multiplied by 5, so a token's 22 weights average
@@ -186,7 +187,8 @@ Why the threshold bites: the router's weights are normalized and then multiplied
 dropped: 37% of all routings. Giving the dropped weight to the kept experts (renormalizing) makes it worse: 2.4150 at
 0.3, 2.6427 at 0.4.
 
-The prompt path is not affected (its skipping is `--prompt-skip-w`, measured at ×1.005 on chunks ≤ 1024 rows).
+The prompt path is not affected (its skipping is `--prompt-skip-w`, measured at ×1.005 on chunks ≤ 1024 rows with
+0.3; ×1.004 at 0.3 and ×1.012 at 0.4 in the 2026-10-22 sweep, `REVIEW_2026-10-22.md`).
 
 More decode speed has to come from exact methods: the CPU computing missed experts while the GPU works (Strata's CPU
 pool for swift15), and fewer bytes per miss (the sparse `down_proj` below, ROADMAP item 4).

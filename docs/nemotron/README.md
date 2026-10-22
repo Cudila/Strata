@@ -61,11 +61,17 @@ Quality:
   The next MoE layer is planned ahead. The cache is LFU with decay.
 - **Skipping misses by router weight.** A missed expert whose weight is below τ in every row is not fetched. In decode
   this costs ×1.008 PPL with the prefetch on (precise mode) and ×1.091 with it off (fast mode). In short prompts
-  (`--prompt-skip-w`) it costs ×1.005 and makes them ~8× faster: they are bound by PCIe, not compute.
+  (`--prompt-skip-w`) it costs ×1.004 at 0.3 and ×1.012 at 0.4 (PPL on 1,024-token chunks) and makes them ~8× faster:
+  they are bound by PCIe, not compute.
 - **Mamba-2.** Chunked SSD in FP32 for prompts. A sequential scan for MTP verify windows, bit-identical to the decode
   step, so drafts can be rolled back exactly.
 - **Attention.** int8 K and FP16 V in a paged cache. Q·K is int8 mma and P·V is FP16 mma. Split-K in decode reads each
   key once for the whole verify window.
+- **Checkpoints inside a conversation.** A Mamba state cannot be rolled back, so the engine sets states aside in
+  pinned RAM (at message boundaries, every 16K tokens of a long prompt, and after each answer) and parks whole
+  conversations there. An agent turn at 75K no longer re-reads the previous answer, and a side request or a branch no
+  longer costs a re-read of the context. Opt-in: `--prompt-cache`, `--conversation-cache-mib`
+  (`docs/nemotron/CONVERSATION_CACHE.md`).
 - **1M context in VRAM.** KV pages of 65 536 cells are taken from the expert cache as the context grows and are given
   back on the next conversation.
 - **MTP speculation.** 5 drafts with a 0.8 probability cut-off: ~3 tokens per window on long context.
@@ -103,8 +109,17 @@ an MTP attention window and FP8 attention.
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
 cmake --build build -j --target strata-nemotron
 ./build/strata-nemotron --gguf Nemotron-3.5-Super-120B-A12B-NVFP4-00001-of-00002.gguf --max-context 1048576 --chunk 16384 --spec 5 \
-  --spec-min-p 0.8 --skip-w 0.4 --evict lfu --prompt-skip-w 0.3 --prompt-skip-max 8192 --kv-base 65536 --serve
+  --spec-min-p 0.8 --skip-w 0.4 --evict lfu --prompt-skip-w 0.4 --prompt-skip-max 8192 --kv-base 65536 \
+  --prompt-cache 8 --conversation-cache-mib 3000 --serve
 ```
+
+Options added on 2026-10-22, all off unless given:
+- `--prompt-cache N`: up to N live checkpoints of the current conversation (a pinned pool of ~165 MB each);
+- `--prompt-cache-every M`: a checkpoint every M tokens of a long prompt (default 16384, 0 = none);
+- `--conversation-cache-mib X`: pinned RAM for parked conversations.
+
+`--prompt-skip-w` is 0.4 in the example config since 2026-10-22 (it was 0.3): short turns at 75K got ~45% faster for
+PPL ×1.012 against ×1.004 (`REVIEW_2026-10-22.md`, section 4).
 
 The OpenAI-compatible server: `python serve/server.py --config <config>.json`. An example config:
 `docs/nemotron/strata-nemotron.example.json` (paths relative to the repository, the shards in `models/`). Its
@@ -151,9 +166,40 @@ cmake --build build-vision -j --target strata-vision
 ```
 
 Put `mmproj-BF16.gguf` in `models/`. The example config's `"vision"` section then starts the encoder on the GPU
-(2.9 GB of VRAM: the expert cache gets 116 slots a layer instead of 140). Encoding takes 36–463 ms per picture,
-512–3300 tokens. `tools/nemotron/vision_check.py` compares the encoder with a float32 transcription of NVIDIA's code
+(2.9 GB of VRAM: the expert cache gets 116 slots a layer instead of 140). One encoder call (decode, resize, GPU encode,
+file write) takes 22–424 ms per picture for 300–3,311 tokens. `tools/nemotron/vision_check.py` compares the encoder with a float32 transcription of NVIDIA's code
 (per-token cosine ≥ 0.998). Details: `docs/nemotron/VISION_MMPROJ.md`.
+
+## Agent sessions (2026-10-22)
+
+A review of short turns at long context and of pictures, on the same machine. Old build against new, with the
+conversation cache on and `--prompt-skip-w 0.4` (one server run per arm):
+
+| | before | after |
+|---|---:|---:|
+| a 30-token turn after a 75K prefix, time to first token | 300 ms | 160 ms |
+| the same turn after a request from another conversation (81K session) | 7,803 ms | 204 ms |
+| a branch of the 81K history (+200 tokens) | 7,844 ms | 235 ms |
+| a 1920×1080 picture, cold, time to first token | 1,347 / 1,024 ms | 1,058 / 774 ms |
+
+Decode speed did not change (inside the 8–12% spread between identical runs). Details, what was tried and dropped:
+`docs/nemotron/REVIEW_2026-10-22.md`.
+
+## Documents
+
+In `docs/nemotron/` (Russian originals of some of them are in `ru/`, working notes in `notes/`):
+
+| file | what |
+|---|---|
+| `OPTIMIZATION_NOTES.md` | what we learned about the architecture, what was tried and dropped |
+| `ENGINE_V1.md`, `ENGINE_V2.md`, `ENGINE_V3.md` | the three engine generations, with measurements and the engine options |
+| `CONVERSATION_CACHE.md` | checkpoints and parked conversations: flags, rules, sizes, limits |
+| `REVIEW_2026-10-22.md` | the 2026-10-22 review: the measured decode window, what changed, A/B, what was dropped |
+| `VISION_MMPROJ.md` | the vision tower and the encoder |
+| `STAGE*.md`, `TENSOR_MAP.md` | the stage-by-stage build log and the tensor map |
+| `ROADMAP.md` | the plan |
+| `strata-nemotron.example.json`, `strata-nemotron-16gb.example.json` | server configs |
+| `publish/HF_MODEL_CARD.md` | the Hugging Face model card |
 
 ## Not done
 
