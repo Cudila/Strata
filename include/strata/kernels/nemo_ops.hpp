@@ -42,6 +42,10 @@ void nemo_layer_norm_rows(const float* x, const float* w, float* out, int64_t T,
 /// out[t] = the first index of row t's largest value (T rows of n); with `prob`, also its softmax probability.
 void nemo_argmax_rows(const float* x, int64_t T, int64_t n, int32_t* out, void* stream, float* prob = nullptr);
 
+/// out_v / out_i: the k (<= 1024) largest values of each of T rows of n and their indices, descending (ties: the
+/// lower index first); row r at r * k.  The sampler's candidates (STRATA_NEMO_GPU_TOPK).
+void nemo_topk_rows(const float* x, int64_t T, int64_t n, int k, float* out_v, int32_t* out_i, void* stream);
+
 /// For k routed ids (device) of experts resident at base + e * stride (up, then down at + ub): ptr[j] / ptr[k + j]
 /// and s2[j] / s2[k + j] (their scale_2) - nemo_experts_part's inputs without a trip to the host.
 void nemo_resident_expert_ptrs(const int32_t* ids, const uint8_t* base, uint64_t stride, uint64_t ub,

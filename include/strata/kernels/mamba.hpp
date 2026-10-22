@@ -66,13 +66,16 @@ void mamba_gated_norm(const float* y, const float* z, const float* w, float* out
 // row's first d_inner.  `xbc` is (T, conv_dim), `y` is (T, d_inner).
 
 /// The conv over T tokens with the carried history: out[t][c] = silu(sum_i in[t-(d_conv-1)+i][c] * kW[c*d_conv+i] +
-/// bias[c]), in[] before t = 0 coming from `conv_state`, which is then the last d_conv-1 inputs.
+/// bias[c]), in[] before t = 0 coming from `conv_state`, which is then the last d_conv-1 inputs.  With
+/// `conv_state_out` the history is read from `conv_state` (left untouched) and the new one written there.
 void mamba_conv_prefill(float* conv_state, const float* zx, int64_t ld_zx, const float* kW, const float* bias,
-                        float* xbc, int64_t T, const MambaShapes& s, void* stream);
+                        float* xbc, int64_t T, const MambaShapes& s, void* stream, float* conv_state_out = nullptr);
 
 /// The recurrence over T tokens from `state`, which is left after the last one; `y` before the gate and norm.
+/// With `state_out` (T < 64, the sequential scan only) `state` is left untouched and the new state goes there.
 void mamba_ssm_scan(float* state, const float* xbc, const float* zx, int64_t ld_zx, const float* dt_bias,
-                    const float* A, const float* D, float* y, int64_t T, const MambaShapes& s, void* stream);
+                    const float* A, const float* D, float* y, int64_t T, const MambaShapes& s, void* stream,
+                    float* state_out = nullptr);
 
 /// mamba_gated_norm for T tokens: y (T, d_inner), z = zx row t's first d_inner.
 void mamba_gated_norm_rows(const float* y, const float* zx, int64_t ld_zx, const float* w, float* out,

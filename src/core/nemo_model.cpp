@@ -107,6 +107,8 @@ struct ExpertLayer {
     std::vector<uint64_t> used;    ///< slot -> last use (LRU clock)
     std::vector<float> score;      ///< expert -> decayed use count (STRATA_NEMO_EVICT=lfu), as of score_at
     std::vector<uint64_t> score_at;
+    std::vector<float> dsc;        ///< STRATA_NEMO_LFU_FAST: every slot's decayed score as of dsc_ticks (-1: empty slot)
+    uint64_t dsc_ticks = UINT64_MAX;
     uint64_t ticks = 0;            ///< tokens this layer has routed (decode / verify rows)
 };
 
@@ -605,6 +607,22 @@ struct NemoModel::Impl {
     int32_t* vtok = nullptr;       ///< their argmax
     int32_t* h_vtok = nullptr;     ///< pinned
     std::vector<float> pick_row;   ///< a sampled step's row on the host
+    // ---- batch 1 switches (all default off) ----
+    static bool env_on(const char* n) { const char* v = std::getenv(n); return v && std::atoi(v) != 0; }
+    const bool shared_early = env_on("STRATA_NEMO_SHARED_EARLY");   ///< T1: decode's shared expert before the ids sync
+    const bool lfu_fast = env_on("STRATA_NEMO_LFU_FAST");           ///< T2: decayed LFU scores once per pass
+    const bool lfu_check = env_on("STRATA_NEMO_LFU_CHECK");         ///< T2: compare it with the per-slot exp
+    const bool mamba_swap = env_on("STRATA_NEMO_MAMBA_SWAP");       ///< T3: out-of-place verify scan + pointer swap
+    const bool mtp_event = env_on("STRATA_NEMO_MTP_EVENT");         ///< T5: event instead of a drain in mtp_rows
+    uint64_t lfu_mismatch = 0, lfu_checked = 0;
+    bool verify_swap = false;      ///< this verify window writes the Mamba state into spec_state / spec_conv
+    cudaEvent_t ids_ev = nullptr;  ///< T1: after the ids read-back
+    cudaEvent_t stage_ev = nullptr;   ///< T5: after the MTP stage's H2D
+    float* d_tk_v = nullptr;       ///< T4: top-k candidates (MM rows x 1024), device and pinned
+    int32_t* d_tk_i = nullptr;
+    float* h_tk_v = nullptr;
+    int32_t* h_tk_i = nullptr;
+    bool gpu_topk_on() { return env_on("STRATA_NEMO_GPU_TOPK") && d_tk_v && h_tk_v; }
     double spec_ms[4] = {0};
     float spec_min_p = std::getenv("STRATA_NEMO_SPEC_MIN_P") ? (float) std::atof(std::getenv("STRATA_NEMO_SPEC_MIN_P")) : 0.0f;       ///< drafting, verifying, the rest (pick, rollback, MTP entries); windows
     std::chrono::steady_clock::time_point ht[3];
@@ -850,6 +868,9 @@ NemoModel::NemoModel() : impl_(new Impl) {}
 
 NemoModel::~NemoModel() {
     if (!impl_) return;
+    if (impl_->lfu_check)
+        std::fprintf(stderr, "lfu check: %llu victim searches, %llu mismatches\n",
+                     (unsigned long long) impl_->lfu_checked, (unsigned long long) impl_->lfu_mismatch);
     if (impl_->zero_stats && !impl_->zs.empty()) {
         const int64_t FF = g_.n_ff_exp;
         std::array<uint64_t, 5> all{};
@@ -1296,6 +1317,12 @@ bool NemoModel::load(const NemoOptions& opt, std::string& err) {
                 !I.allocT(&I.vlogits, (size_t) MMr * g_.n_vocab, err) || !I.allocT(&I.vtok, (size_t) MMr, err))
                 return false;
             NCK(cudaMallocHost((void**) &I.h_vtok, MMr * sizeof(int32_t)));
+            if (Impl::env_on("STRATA_NEMO_GPU_TOPK")) {
+                if (!I.allocT(&I.d_tk_v, (size_t) MMr * 1024, err) || !I.allocT(&I.d_tk_i, (size_t) MMr * 1024, err))
+                    return false;
+                NCK(cudaMallocHost((void**) &I.h_tk_v, MMr * 1024 * sizeof(float)));
+                NCK(cudaMallocHost((void**) &I.h_tk_i, MMr * 1024 * sizeof(int32_t)));
+            }
         }
     }
     if (main_gguf) {   // the main file again (the MTP file stays open: its mapping backs nothing now, but cheap)
@@ -1715,8 +1742,11 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         strata::kernels::mamba_ssm_step(b.state, I.xbc, zx + DI + CD, b.dt_b, b.A, b.D, I.y, ms, st);
                         strata::kernels::mamba_gated_norm(I.y, zx, b.ssm_norm, I.y, DI, ms.G, eps, st);
                     } else {
-                        strata::kernels::mamba_conv_prefill(b.conv, zx, IN, b.conv_w, b.conv_b, I.xbc, n1, ms, st);
-                        strata::kernels::mamba_ssm_scan(b.state, I.xbc, zx, IN, b.dt_b, b.A, b.D, I.y, n1, ms, st);
+                        // STRATA_NEMO_MAMBA_SWAP: the verify window leaves the new state in spec_state / spec_conv
+                        float* so = I.verify_swap ? I.spec_state[(size_t) b.mamba] : nullptr;
+                        float* co = I.verify_swap ? I.spec_conv[(size_t) b.mamba] : nullptr;
+                        strata::kernels::mamba_conv_prefill(b.conv, zx, IN, b.conv_w, b.conv_b, I.xbc, n1, ms, st, co);
+                        strata::kernels::mamba_ssm_scan(b.state, I.xbc, zx, IN, b.dt_b, b.A, b.D, I.y, n1, ms, st, so);
                         strata::kernels::mamba_gated_norm_rows(I.y, zx, IN, b.ssm_norm, I.y, n1, DI, ms.G, eps, st);
                     }
                     I.gemm(b.out, I.y, DI, I.x + s0 * E, E, n1, false, true);   // x += out_proj(y)
@@ -1777,11 +1807,27 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                     NCK(cudaMemcpyAsync(I.h_pp_w.data(), I.pp_w, (size_t) T * K * sizeof(float), cudaMemcpyDeviceToHost, st));
                 }
                 h_ids.resize((size_t) T * K);
+                bool sh_done = false;   // STRATA_NEMO_SHARED_EARLY: the shared expert already ran (below)
                 if (dec) {   // (pinned: a pageable read-back costs ~100 us of staging per layer)
                     NCK(cudaMemcpyAsync(I.h_dids, I.ids, (size_t) T * K * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
                     if (I.skip_w > 0)
                         NCK(cudaMemcpyAsync(I.h_dw, I.w, (size_t) T * K * sizeof(float), cudaMemcpyDeviceToHost, st));
-                    NCK(cudaStreamSynchronize(st));
+                    if (I.shared_early) {
+                        // the read-back is queued; the shared expert (it needs only xn) goes behind it and the host
+                        // waits for the read-back alone, so the GPU has work while the host books.  (x += shared now,
+                        // x += fc2 later: the two adds swap places)
+                        if (!I.ids_ev) NCK(cudaEventCreateWithFlags(&I.ids_ev, cudaEventDisableTiming));
+                        NCK(cudaEventRecord(I.ids_ev, st));
+                        for (int64_t s0 = 0; s0 < T; s0 += I.SC) {
+                            const int64_t n1 = std::min<int64_t>(I.SC, T - s0);
+                            I.gemm(b.sh_up, I.xn + s0 * E, E, I.sh_h, SH, n1, true, false);
+                            I.gemm(b.sh_dn, I.sh_h, SH, I.x + s0 * E, E, n1, false, true);
+                        }
+                        sh_done = true;
+                        NCK(cudaEventSynchronize(I.ids_ev));
+                    } else {
+                        NCK(cudaStreamSynchronize(st));
+                    }
                     I.ht[0] = std::chrono::steady_clock::now();
                     std::memcpy(h_ids.data(), I.h_dids, (size_t) T * K * sizeof(int32_t));
                 } else {
@@ -1863,7 +1909,9 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         const float ld = (float) std::log(I.lfu_decay);
                         for (int64_t i = 0; i < KT; ++i) {
                             const int32_t e = h_ids[(size_t) i];
-                            X.score[(size_t) e] = X.score[(size_t) e] * std::exp(ld * (float) (X.ticks - X.score_at[(size_t) e])) + 1.0f;
+                            // (STRATA_NEMO_LFU_FAST: a second entry of the pass has age 0, and exp(0) is exactly 1)
+                            if (I.lfu_fast && X.score_at[(size_t) e] == X.ticks) X.score[(size_t) e] += 1.0f;
+                            else X.score[(size_t) e] = X.score[(size_t) e] * std::exp(ld * (float) (X.ticks - X.score_at[(size_t) e])) + 1.0f;
                             X.score_at[(size_t) e] = X.ticks;
                         }
                         X.ticks += (uint64_t) T;
@@ -1885,13 +1933,47 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                             // the least decayed use count among the slots not used in this pass (empty slots first)
                             const float ld = (float) std::log(I.lfu_decay);
                             float lo = INFINITY;
-                            for (int32_t c = 0; c < (int32_t) I.slots; ++c) {
-                                if (XL.used[(size_t) c] >= since) continue;
-                                const int32_t e = XL.expert_in[(size_t) c];
-                                const float sc = e < 0 ? -1.0f
-                                                       : XL.score[(size_t) e] *
-                                                             std::exp(ld * (float) (XL.ticks - XL.score_at[(size_t) e]));
-                                if (sc < lo) { lo = sc; v = c; }
+                            // STRATA_NEMO_LFU_FAST: every slot's decayed score once per ticks value (the scores and
+                            // ticks only move together, in the layer's own pass); a slot that changed hands inside
+                            // the pass is used >= since, so the search never reads its stale entry
+                            const bool fast = I.lfu_fast;
+                            if (fast && XL.dsc_ticks != XL.ticks) {
+                                XL.dsc.resize((size_t) I.slots);
+                                for (int32_t c = 0; c < (int32_t) I.slots; ++c) {
+                                    const int32_t e = XL.expert_in[(size_t) c];
+                                    XL.dsc[(size_t) c] = e < 0 ? -1.0f
+                                                               : XL.score[(size_t) e] *
+                                                                     std::exp(ld * (float) (XL.ticks - XL.score_at[(size_t) e]));
+                                }
+                                XL.dsc_ticks = XL.ticks;
+                            }
+                            int32_t v_old = -1;
+                            if (!fast || I.lfu_check) {
+                                float lo_old = INFINITY;
+                                for (int32_t c = 0; c < (int32_t) I.slots; ++c) {
+                                    if (XL.used[(size_t) c] >= since) continue;
+                                    const int32_t e = XL.expert_in[(size_t) c];
+                                    const float sc = e < 0 ? -1.0f
+                                                           : XL.score[(size_t) e] *
+                                                                 std::exp(ld * (float) (XL.ticks - XL.score_at[(size_t) e]));
+                                    if (sc < lo_old) { lo_old = sc; v_old = c; }
+                                }
+                                lo = lo_old;
+                                v = v_old;
+                            }
+                            if (fast) {
+                                float lo_f = INFINITY;
+                                int32_t v_f = -1;
+                                for (int32_t c = 0; c < (int32_t) I.slots; ++c) {
+                                    if (XL.used[(size_t) c] >= since) continue;
+                                    const float sc = XL.dsc[(size_t) c];
+                                    if (sc < lo_f) { lo_f = sc; v_f = c; }
+                                }
+                                if (I.lfu_check) {
+                                    ++I.lfu_checked;
+                                    if (v_f != v_old) ++I.lfu_mismatch;
+                                }
+                                v = v_f;
                             }
                         } else {
                             uint64_t oldest = UINT64_MAX;
@@ -1915,6 +1997,7 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                     const int ohalf = (int) (b.moe & 1);
                     const int64_t ocap = I.ring ? I.ring_n / 2 : 0;
                     int64_t on = 0;
+                    X.dsc_ticks = UINT64_MAX;   // (LFU_FAST: this pass's victim searches share one decay table)
                     for (size_t u = 0; u < uniq.size(); ++u) {
                         const int32_t e = uniq[u];
                         if (X.slot_of[(size_t) e] >= 0) continue;
@@ -2038,6 +2121,7 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                         const int64_t pt = T == 1 ? 1 : std::min<int64_t>(T, I.prefetch_rows);
                         ++I.clock;
                         const uint64_t q0 = I.clock;
+                        XN.dsc_ticks = UINT64_MAX;
                         for (int64_t j = 0; j < pk; ++j)
                             for (int64_t t = 0; t < pt; ++t) {
                                 const int32_t e = I.h_pids[t * K + j];
@@ -2409,7 +2493,7 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
                 }
                 I.mark(4);
                 I.gemm(b.fc2, I.routed, L, I.x, E, T, false, true);       // x += fc2(routed)
-                for (int64_t s0 = 0; s0 < T && dec; s0 += I.SC) {           // x += shared(xn), in sub-chunks
+                for (int64_t s0 = 0; s0 < T && dec && !sh_done; s0 += I.SC) {   // x += shared(xn), in sub-chunks
                     const int64_t n1 = std::min<int64_t>(I.SC, T - s0);
                     I.gemm(b.sh_up, I.xn + s0 * E, E, I.sh_h, SH, n1, true, false);
                     I.gemm(b.sh_dn, I.sh_h, SH, I.x + s0 * E, E, n1, false, true);
@@ -2468,6 +2552,17 @@ bool NemoModel::forward(const int32_t* tokens, int64_t n, float* logits_out, std
 }
 
 
+bool NemoModel::topk_head(int k, float* vals, int32_t* ids, std::string& err) {
+    Impl& I = *impl_;
+    if (!I.d_tk_v || k <= 0 || k > 1024) { err = "topk_head: STRATA_NEMO_GPU_TOPK is off (or MTP not loaded) or k > 1024"; return false; }
+    cudaStream_t st = I.st;
+    strata::kernels::nemo_topk_rows(I.head_out, 1, g_.n_vocab, k, I.d_tk_v, I.d_tk_i, st);
+    NCK(cudaMemcpyAsync(vals, I.d_tk_v, (size_t) k * sizeof(float), cudaMemcpyDeviceToHost, st));
+    NCK(cudaMemcpyAsync(ids, I.d_tk_i, (size_t) k * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+    NCK(cudaStreamSynchronize(st));
+    return true;
+}
+
 bool NemoModel::has_mtp() const { return impl_->mtp.on; }
 void NemoModel::set_spec_min_p(float p) { impl_->spec_min_p = p; }
 
@@ -2482,10 +2577,17 @@ bool NemoModel::mtp_rows(const int32_t* toks, const float* h, int64_t n, int64_t
     as.n_head = g_.n_head; as.n_head_kv = g_.n_head_kv; as.head_dim = g_.head_dim;
     (void) KD;
     // the next tokens' embeddings (the stage is the MTP's own: the main forward's may still be in flight)
-    NCK(cudaStreamSynchronize(st));
+    if (I.mtp_event) {
+        // STRATA_NEMO_MTP_EVENT: only the previous H2D from the stage must be done (an unrecorded event is complete)
+        if (!I.stage_ev) NCK(cudaEventCreateWithFlags(&I.stage_ev, cudaEventDisableTiming));
+        NCK(cudaEventSynchronize(I.stage_ev));
+    } else {
+        NCK(cudaStreamSynchronize(st));
+    }
     for (int64_t t = 0; t < n; ++t) std::memcpy(M.stage + t * E, I.embd + (size_t) toks[t] * E, E * sizeof(uint16_t));
     uint16_t* d_emb = (uint16_t*) M.a;
     NCK(cudaMemcpyAsync(d_emb, M.stage, (size_t) n * E * sizeof(uint16_t), cudaMemcpyHostToDevice, st));
+    if (I.mtp_event) NCK(cudaEventRecord(I.stage_ev, st));
     strata::kernels::nemo_bf16_rows_to_f32(d_emb, M.e, n, E, st);
     I.img_overlay(M.e, pos0 + 1, n, E, st);   // row t pairs h at pos0 + t with the token at pos0 + t + 1
     // u = eh_proj([enorm(e), hnorm(h)])
@@ -2607,10 +2709,12 @@ bool NemoModel::mtp_draft(int32_t next, int n, int32_t* drafts, std::string& err
 
 
 bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::string& err,
-                          const std::function<int32_t(const float*)>* pick) {
+                          const std::function<int32_t(const float*)>* pick,
+                          const std::function<int32_t(const float*, const int32_t*, int)>* pick_topk, int topk) {
     Impl& I = *impl_;
     Impl::Mtp& M = I.mtp;
     out.clear();
+    const bool gtk = pick && pick_topk && topk > 0 && topk <= 1024 && I.gpu_topk_on();
     n = std::min<int>(n, strata::kernels::NEMO_GEMV_MAX_M - 1);
     if (pos_ + n + 1 > max_ctx_) n = (int) (max_ctx_ - pos_ - 1);
     std::vector<int32_t> w((size_t) n + 1);
@@ -2619,6 +2723,11 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
     if (!M.on || !M.pending || n <= 0 || !mtp_draft(next, n, w.data() + 1, err)) {
         if (!err.empty()) return false;
         // no drafting possible: one plain step
+        if (gtk) {
+            if (!forward(&next, 1, nullptr, err) || !topk_head(topk, I.h_tk_v, I.h_tk_i, err)) return false;
+            out.push_back((*pick_topk)(I.h_tk_v, I.h_tk_i, topk));
+            return true;
+        }
         std::vector<float> lg((size_t) g_.n_vocab);
         if (!forward(&next, 1, lg.data(), err)) return false;
         out.push_back(pick ? (*pick)(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin()));
@@ -2630,7 +2739,9 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
     const size_t sb = sizeof(float) * g_.ssm_n_head * g_.ssm_head_dim() * g_.ssm_d_state;
     const size_t cb = sizeof(float) * g_.ssm_conv_dim() * (g_.ssm_d_conv - 1);
     cudaStream_t st = I.st;
-    // the Mamba state before the window
+    // the Mamba state before the window (STRATA_NEMO_MAMBA_SWAP: none; the window's scan writes elsewhere)
+    const bool swap = I.mamba_swap && Mw >= 2 && Mw < 64 && Mw <= I.SC;
+    if (!swap)
     for (Block& b : I.blocks)
         if (b.kind == NemotronBlock::Mamba) {
             NCK(cudaMemcpyAsync(I.spec_state[(size_t) b.mamba], b.state, sb, cudaMemcpyDeviceToDevice, st));
@@ -2639,8 +2750,10 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
     const int64_t p0 = pos_;
     const auto tq1 = std::chrono::steady_clock::now();
     I.verify = true;
+    I.verify_swap = swap;
     const bool ok = forward(w.data(), Mw, nullptr, err);
     I.verify = false;
+    I.verify_swap = false;
     if (!ok) return false;
     const auto tq2 = std::chrono::steady_clock::now();
     int64_t a = 1;   // rows kept: the fed token and the drafts the main model agrees with
@@ -2650,6 +2763,19 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
         NCK(cudaStreamSynchronize(st));
         while (a < Mw && w[(size_t) a] == I.h_vtok[a - 1]) ++a;
         last = I.h_vtok[a - 1];
+    } else if (gtk) {
+        // sampled, top-k candidates from the device: one kernel over the Mw rows, one read-back, then the host draws
+        // exactly as the full-row path does
+        strata::kernels::nemo_topk_rows(I.vlogits, Mw, g_.n_vocab, topk, I.d_tk_v, I.d_tk_i, st);
+        NCK(cudaMemcpyAsync(I.h_tk_v, I.d_tk_v, (size_t) Mw * topk * sizeof(float), cudaMemcpyDeviceToHost, st));
+        NCK(cudaMemcpyAsync(I.h_tk_i, I.d_tk_i, (size_t) Mw * topk * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        NCK(cudaStreamSynchronize(st));
+        for (int64_t r = 0; r < Mw; ++r) {
+            const int32_t y = (*pick_topk)(I.h_tk_v + r * topk, I.h_tk_i + r * topk, topk);
+            if (r + 1 < Mw && y == w[(size_t) r + 1]) { ++a; continue; }
+            last = y;
+            break;
+        }
     } else {
         // a sampled step: each row's token drawn from the main model's own distribution, a draft kept while it is
         // the token drawn (the kept tokens are exactly what plain sampling would have drawn)
@@ -2667,6 +2793,14 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
     stats_.spec_windows += 1;
     stats_.spec_drafted += (uint64_t) n;
     stats_.spec_accepted += (uint64_t) (a - 1);
+    if (swap && a == Mw) {
+        // a full accept: the window's state is the new one
+        for (Block& b : I.blocks)
+            if (b.kind == NemotronBlock::Mamba) {
+                std::swap(b.state, I.spec_state[(size_t) b.mamba]);
+                std::swap(b.conv, I.spec_conv[(size_t) b.mamba]);
+            }
+    }
     if (a < Mw) {
         // back to the state before the window, then the kept rows again (conv + scan only: their outputs were used)
         strata::kernels::MambaShapes ms;
@@ -2674,8 +2808,10 @@ bool NemoModel::spec_step(int32_t next, int n, std::vector<int32_t>& out, std::s
         ms.d_conv = g_.ssm_d_conv;
         for (Block& b : I.blocks)
             if (b.kind == NemotronBlock::Mamba) {
-                NCK(cudaMemcpyAsync(b.state, I.spec_state[(size_t) b.mamba], sb, cudaMemcpyDeviceToDevice, st));
-                NCK(cudaMemcpyAsync(b.conv, I.spec_conv[(size_t) b.mamba], cb, cudaMemcpyDeviceToDevice, st));
+                if (!swap) {   // (swap: b.state / b.conv were never touched)
+                    NCK(cudaMemcpyAsync(b.state, I.spec_state[(size_t) b.mamba], sb, cudaMemcpyDeviceToDevice, st));
+                    NCK(cudaMemcpyAsync(b.conv, I.spec_conv[(size_t) b.mamba], cb, cudaMemcpyDeviceToDevice, st));
+                }
                 const float* zx = I.spec_zx + (size_t) b.mamba * strata::kernels::NEMO_GEMV_MAX_M * IN;
                 strata::kernels::mamba_conv_prefill(b.conv, zx, IN, b.conv_w, b.conv_b, I.xbc, a, ms, st);
                 strata::kernels::mamba_ssm_scan(b.state, I.xbc, zx, IN, b.dt_b, b.A, b.D, I.y, a, ms, st);

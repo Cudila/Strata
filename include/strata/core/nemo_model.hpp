@@ -130,7 +130,12 @@ public:
     /// is refused).  `out` gets the kept drafts and the main model's token after them (1 .. n + 1 tokens).
     /// `pick` (optional) draws a row's token from its logits (host, n_vocab): sampling; without it, greedy.
     bool spec_step(int32_t next, int n, std::vector<int32_t>& out, std::string& err,
-                   const std::function<int32_t(const float*)>* pick = nullptr);
+                   const std::function<int32_t(const float*)>* pick = nullptr,
+                   const std::function<int32_t(const float*, const int32_t*, int)>* pick_topk = nullptr, int topk = 0);
+    /// STRATA_NEMO_GPU_TOPK=1 (needs the MTP block): the k (<= 1024) largest logits of the last forward's row and
+    /// their ids, descending, into `vals` / `ids` (host, k each; the pinned buffers spec_step uses are fine).
+    /// `pick_topk` of spec_step draws from such candidates (vals, ids, k) instead of a full row.
+    bool topk_head(int k, float* vals, int32_t* ids, std::string& err);
 
     NemoStats stats() const { return stats_; }
     /// STRATA_NEMO_PROFILE=1: where the time went since the last report (empty when profiling is off).

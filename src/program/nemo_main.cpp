@@ -61,6 +61,40 @@ struct Sampling {
     uint64_t seed = 0;
 };
 
+/// The draw of sample() over the top-k candidates (descending logits `v` with their ids), temperature > 0.
+int32_t sample_topk(const float* v, const int32_t* ids, int k, const Sampling& s, std::mt19937_64& rng) {
+    std::vector<double> p((size_t) k);
+    const double mx = v[0];
+    double sum = 0;
+    for (int i = 0; i < k; ++i) sum += (p[(size_t) i] = std::exp((v[i] - mx) / s.temperature));
+    int keep = k;
+    double cum = 0;
+    for (int i = 0; i < k; ++i) {
+        p[(size_t) i] /= sum;
+        if (s.min_p > 0 && p[(size_t) i] < s.min_p * p[0]) { keep = i; break; }
+        cum += p[(size_t) i];
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max(keep, 1);
+    double tot = 0;
+    for (int i = 0; i < keep; ++i) tot += p[(size_t) i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (int i = 0; i < keep; ++i) {
+        r -= p[(size_t) i];
+        if (r <= 0) return ids[i];
+    }
+    return ids[keep - 1];
+}
+
+/// STRATA_NEMO_GPU_TOPK=1: the candidates come from the device (k = the request's top_k, or 1024 when unset; a
+/// top_k above 1024 keeps the full-row path).  Returns k, or 0 when off.
+int gpu_topk_k(const Sampling& s) {
+    const char* e = std::getenv("STRATA_NEMO_GPU_TOPK");
+    if (!e || !std::atoi(e) || s.temperature <= 0.0f || s.top_k > 1024) return 0;
+    return s.top_k > 0 ? s.top_k : 1024;
+}
+
 /// Greedy at temperature <= 0; otherwise temperature, then top-k, top-p and min-p over the softmax, then a draw.
 int32_t sample(const float* logits, int64_t n, const Sampling& s, std::mt19937_64& rng) {
     if (s.temperature <= 0.0f) return (int32_t) (std::max_element(logits, logits + n) - logits);
@@ -405,11 +439,14 @@ int run_serve(strata::core::NemoModel& m) {
         } else {
             m.reset();
         }
+        // STRATA_NEMO_GPU_TOPK: the first token's candidates come from head_out; the full logits are not read back
+        const bool gtk_first = gpu_topk_k(sp) > 0 && g_spec > 0 && m.has_mtp();
+        bool host_logits = !gtk_first;
         const auto feed = [&](int64_t upto) {   // the prompt from `at` to `upto`, a checkpoint every g_every tokens
             while (ok && upto > at) {
                 int64_t to = upto;
                 if (cc_on && g_every > 0) to = std::min(upto, (at / g_every + 1) * g_every);
-                ok = m.forward(prompt.data() + at, to - at, logits.data(), err);
+                ok = m.forward(prompt.data() + at, to - at, gtk_first ? nullptr : logits.data(), err);
                 at = to;
                 if (ok && cc_on && g_every > 0 && at < upto && at % g_every == 0)
                     ok = g_cc.take(m, prompt.data(), cimg, strata::core::ConversationCache::Chunk, err);
@@ -427,7 +464,11 @@ int run_serve(strata::core::NemoModel& m) {
             }
         }
         feed((int64_t) prompt.size());
-        if (ok && !cc_on && at == (int64_t) reused && reused == prompt.size()) logits = m.snapshot_logits();
+        if (ok && at == (int64_t) reused && reused == prompt.size()) {
+            // nothing was fed: the logits come from the checkpoint (conversation cache restores them itself)
+            if (!cc_on) logits = m.snapshot_logits();
+            host_logits = true;
+        }
         if (!ok) {
             snap_prompt.clear();
             g_cc.clear_live();
@@ -452,7 +493,18 @@ int run_serve(strata::core::NemoModel& m) {
         if (g_spec > 0 && m.has_mtp()) {
             // speculation: the first token from the prompt's logits, then windows of MTP drafts verified at once
             const std::function<int32_t(const float*)> pick = [&](const float* lg) { return sample(lg, n_vocab, sp, rng); };
-            int32_t id = sample(logits.data(), n_vocab, sp, rng);
+            const std::function<int32_t(const float*, const int32_t*, int)> pick_tk =
+                [&](const float* v, const int32_t* ids, int k) { return sample_topk(v, ids, k, sp, rng); };
+            const int gk = gpu_topk_k(sp);
+            int32_t id;
+            if (gk && !host_logits) {
+                std::vector<float> tv((size_t) gk);
+                std::vector<int32_t> ti((size_t) gk);
+                if (!m.topk_head(gk, tv.data(), ti.data(), err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
+                id = sample_topk(tv.data(), ti.data(), gk, sp, rng);
+            } else {
+                id = sample(logits.data(), n_vocab, sp, rng);
+            }
             for (;;) {
                 std::printf("T %d\n", id);
                 std::fflush(stdout);
@@ -474,7 +526,7 @@ int run_serve(strata::core::NemoModel& m) {
                             break;
                         }
                         got.assign(1, sample(logits.data(), n_vocab, sp, rng));
-                    } else if (!m.spec_step(id, (int) nd, got, err, sp.temperature > 0 ? &pick : nullptr)) {
+                    } else if (!m.spec_step(id, (int) nd, got, err, sp.temperature > 0 ? &pick : nullptr, gk ? &pick_tk : nullptr, gk)) {
                         std::printf("ERR %s\n", err.c_str());
                         ok = false;
                         break;
@@ -559,7 +611,9 @@ int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t
     std::string err;
     m.reset();
     auto t0 = Clock::now();
-    if (!m.forward(ids.data(), (int64_t) ids.size(), lg.data(), err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
+    // STRATA_NEMO_GPU_TOPK with --temp: the first token's candidates come from the device too
+    const bool bench_gtk = spec > 0 && temp > 0 && m.has_mtp() && std::getenv("STRATA_NEMO_GPU_TOPK") && std::atoi(std::getenv("STRATA_NEMO_GPU_TOPK"));
+    if (!m.forward(ids.data(), (int64_t) ids.size(), bench_gtk ? nullptr : lg.data(), err)) { std::fprintf(stderr, "forward: %s\n", err.c_str()); return 1; }
     const double pms = ms_since(t0);
     m.profile_report(true);
     const auto s0 = m.stats();
@@ -574,11 +628,17 @@ int run_bench(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t
         sp.top_k = 64;
         std::mt19937_64 rng(1);
         const std::function<int32_t(const float*)> pick = [&](const float* l) { return sample(l, n_vocab, sp, rng); };
-        int32_t t = temp > 0 ? pick(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        const std::function<int32_t(const float*, const int32_t*, int)> pick_tk =
+            [&](const float* v, const int32_t* i2, int k) { return sample_topk(v, i2, k, sp, rng); };
+        const int gk = bench_gtk ? gpu_topk_k(sp) : 0;
+        std::vector<float> tv(1024);
+        std::vector<int32_t> ti(1024);
+        if (gk && !m.topk_head(gk, tv.data(), ti.data(), err)) { std::fprintf(stderr, "topk: %s\n", err.c_str()); return 1; }
+        int32_t t = gk ? sample_topk(tv.data(), ti.data(), gk, sp, rng) : temp > 0 ? pick(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
         std::vector<int32_t> got;
         while ((int64_t) out.size() < gen) {
             out.push_back(t);
-            if (!m.spec_step(t, spec, got, err, temp > 0 ? &pick : nullptr)) { std::fprintf(stderr, "spec: %s\n", err.c_str()); return 1; }
+            if (!m.spec_step(t, spec, got, err, temp > 0 ? &pick : nullptr, gk ? &pick_tk : nullptr, gk)) { std::fprintf(stderr, "spec: %s\n", err.c_str()); return 1; }
             for (size_t k = 0; k + 1 < got.size() && (int64_t) out.size() < gen; ++k) out.push_back(got[k]);
             t = got.back();
         }

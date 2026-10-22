@@ -91,17 +91,18 @@ __global__ void mamba_conv_prefill_kernel(const float* __restrict__ cs, const fl
 }
 
 /// The conv history after T tokens: the last d_conv-1 inputs, oldest first (from the state when T < d_conv-1).
-__global__ void mamba_conv_state_kernel(float* __restrict__ cs, const float* __restrict__ zx, int64_t ld_zx,
+__global__ void mamba_conv_state_kernel(const float* cs, float* cs_out, const float* __restrict__ zx, int64_t ld_zx,
                                         int64_t off, int C, int dc, int T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    float* st = cs + (size_t) c * (dc - 1);
+    const float* st = cs + (size_t) c * (dc - 1);   // (cs_out == cs: in place; each thread reads its channel before writing it)
+    float* so = cs_out + (size_t) c * (dc - 1);
     float nv[8];
     for (int i = 0; i < dc - 1; ++i) {
         const int src = T - (dc - 1) + i;
         nv[i] = src < 0 ? st[dc - 1 + src] : zx[(size_t) src * ld_zx + off + c];
     }
-    for (int i = 0; i < dc - 1; ++i) st[i] = nv[i];
+    for (int i = 0; i < dc - 1; ++i) so[i] = nv[i];
 }
 
 constexpr int SCAN_TT = 32;   ///< tokens staged in shared memory per pass
@@ -110,7 +111,7 @@ constexpr int SCAN_TT = 32;   ///< tokens staged in shared memory per pass
 /// dt; a pass stages SCAN_TT tokens of them in shared memory, then each warp steps its row through them with the
 /// state in registers.  The per-token arithmetic is mamba_ssm_kernel's, expression for expression.
 template <int NPL>
-__global__ void mamba_scan_kernel(float* __restrict__ state, const float* __restrict__ xbc,
+__global__ void mamba_scan_kernel(const float* state, float* state_out, const float* __restrict__ xbc,
                                   const float* __restrict__ zx, int64_t ld_zx, const float* __restrict__ dt_bias,
                                   const float* __restrict__ A, const float* __restrict__ D, float* __restrict__ y,
                                   int H, int P, int G, int T) {
@@ -200,7 +201,7 @@ __global__ void mamba_scan_kernel(float* __restrict__ state, const float* __rest
         __syncthreads();
     }
 #pragma unroll
-    for (int k = 0; k < NPL; ++k) state[(size_t) row * N + lane + 32 * k] = s[k];
+    for (int k = 0; k < NPL; ++k) state_out[(size_t) row * N + lane + 32 * k] = s[k];   // (state_out == state: in place)
 }
 
 // ---- the prompt's form: chunked SSD (Mamba-2's state-space dual) ----
@@ -503,19 +504,24 @@ void mamba_gated_norm_rows(const float* y, const float* zx, int64_t ld_zx, const
 }
 
 void mamba_conv_prefill(float* conv_state, const float* zx, int64_t ld_zx, const float* kW, const float* bias,
-                        float* xbc, int64_t T, const MambaShapes& s, void* stream) {
+                        float* xbc, int64_t T, const MambaShapes& s, void* stream, float* conv_state_out) {
     if (T <= 0) return;
     const int C = (int) s.conv_dim(), threads = 256;
     cudaStream_t st = (cudaStream_t) stream;
     mamba_conv_prefill_kernel<<<dim3((unsigned) ((C + threads - 1) / threads), (unsigned) T), threads, 0, st>>>(
         conv_state, zx, ld_zx, s.d_inner(), kW, bias, xbc, C, (int) s.d_conv, (int) T);
-    mamba_conv_state_kernel<<<(C + threads - 1) / threads, threads, 0, st>>>(conv_state, zx, ld_zx, s.d_inner(), C,
-                                                                              (int) s.d_conv, (int) T);
+    mamba_conv_state_kernel<<<(C + threads - 1) / threads, threads, 0, st>>>(
+        conv_state, conv_state_out ? conv_state_out : conv_state, zx, ld_zx, s.d_inner(), C, (int) s.d_conv, (int) T);
 }
 
 void mamba_ssm_scan(float* state, const float* xbc, const float* zx, int64_t ld_zx, const float* dt_bias,
-                    const float* A, const float* D, float* y, int64_t T, const MambaShapes& s, void* stream) {
+                    const float* A, const float* D, float* y, int64_t T, const MambaShapes& s, void* stream,
+                    float* state_out) {
     if (T <= 0 || s.P % SSM_WARPS) return;
+    // state_out (optional): the scan reads `state` and leaves the new state there instead (only the sequential scan,
+    // i.e. the verify window's T < SSD_MIN; the chunked prompt scan is always in place)
+    if (state_out && T >= SSD_MIN) return;
+    float* so = state_out ? state_out : state;
     const int blocks = (int) (s.H * s.P / SSM_WARPS);
     cudaStream_t st = (cudaStream_t) stream;
     if (T >= SSD_MIN && s.N == 128 && s.P % SSD_PS == 0 && !std::getenv("STRATA_NEMO_SEQ_SCAN")) {
@@ -544,11 +550,11 @@ void mamba_ssm_scan(float* state, const float* xbc, const float* zx, int64_t ld_
     }
     switch (s.N) {
     case 64:
-        mamba_scan_kernel<2><<<blocks, SSM_WARPS * 32, 0, st>>>(state, xbc, zx, ld_zx, dt_bias, A, D, y, (int) s.H,
+        mamba_scan_kernel<2><<<blocks, SSM_WARPS * 32, 0, st>>>(state, so, xbc, zx, ld_zx, dt_bias, A, D, y, (int) s.H,
                                                                 (int) s.P, (int) s.G, (int) T);
         break;
     case 128:
-        mamba_scan_kernel<4><<<blocks, SSM_WARPS * 32, 0, st>>>(state, xbc, zx, ld_zx, dt_bias, A, D, y, (int) s.H,
+        mamba_scan_kernel<4><<<blocks, SSM_WARPS * 32, 0, st>>>(state, so, xbc, zx, ld_zx, dt_bias, A, D, y, (int) s.H,
                                                                 (int) s.P, (int) s.G, (int) T);
         break;
     default:

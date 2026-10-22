@@ -204,6 +204,113 @@ __global__ void argmax_kernel(const float* __restrict__ x, int64_t n, int32_t* _
     }
 }
 
+
+/// Order-preserving float -> uint32 (larger float, larger key); -0 is +0 and NaN is the smallest key.
+__device__ __forceinline__ uint32_t topk_key(float f) {
+    if (f != f) return 0u;
+    if (f == 0.0f) f = 0.0f;
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+constexpr int TOPK_MAX = 1024;
+
+/// The k largest values of each row (one block of 1024 threads a row), descending, ties to the lower index.
+/// Radix select of the k-th key (4 x 8 bits), then an index-ordered compaction of the keys above it and of the first
+/// (k - above) equal to it, then a bitonic sort in shared memory.  out_v / out_i: row r at r * k.
+__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ x, int64_t n, int k,
+                                                    float* __restrict__ out_v, int32_t* __restrict__ out_i) {
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t sh_prefix, sh_need, sh_above;
+    __shared__ uint32_t wcnt[2][32];
+    __shared__ uint32_t run[2];
+    __shared__ uint32_t ckey[TOPK_MAX];
+    __shared__ int32_t cidx[TOPK_MAX];
+    const float* xr = x + (size_t) blockIdx.x * n;
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    if (tid == 0) { sh_prefix = 0; sh_need = (uint32_t) k; sh_above = 0; run[0] = 0; run[1] = 0; }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        for (int b = tid; b < 256; b += 1024) hist[b] = 0;
+        __syncthreads();
+        const uint32_t prefix = sh_prefix;
+        const uint32_t hi = pass == 0 ? 0u : (prefix >> (shift + 8));   // the digits chosen so far
+        for (int64_t i = tid; i < n; i += 1024) {
+            const uint32_t key = topk_key(xr[i]);
+            if (pass == 0 || (key >> (shift + 8)) == hi) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            uint32_t need = sh_need, above = sh_above;
+            int b = 255;
+            for (; b > 0; --b) {
+                if (hist[b] >= need) break;
+                need -= hist[b];
+                above += hist[b];
+            }
+            sh_prefix = prefix | ((uint32_t) b << shift);
+            sh_need = need;
+            sh_above = above;
+        }
+        __syncthreads();
+    }
+    const uint32_t T = sh_prefix, above = sh_above;   // the k-th largest key; `above` keys are larger
+    // compaction in index order: chunk after chunk of 1024, ballots per warp
+    for (int64_t base = 0; base < n; base += 1024) {
+        const int64_t i = base + tid;
+        uint32_t key = 0;
+        bool gt = false, eq = false;
+        if (i < n) { key = topk_key(xr[i]); gt = key > T; eq = key == T; }
+        const uint32_t mg = __ballot_sync(0xffffffffu, gt), me = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) { wcnt[0][wid] = __popc(mg); wcnt[1][wid] = __popc(me); }
+        __syncthreads();
+        uint32_t pg = run[0], pe = run[1];
+        for (int w = 0; w < wid; ++w) { pg += wcnt[0][w]; pe += wcnt[1][w]; }
+        const uint32_t lm = (1u << lane) - 1u;
+        if (gt) {
+            const uint32_t pos = pg + __popc(mg & lm);
+            ckey[pos] = key;
+            cidx[pos] = (int32_t) i;
+        } else if (eq) {
+            const uint32_t pos = above + pe + __popc(me & lm);
+            if (pos < (uint32_t) k) { ckey[pos] = key; cidx[pos] = (int32_t) i; }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            uint32_t tg = 0, te = 0;
+            for (int w = 0; w < 32; ++w) { tg += wcnt[0][w]; te += wcnt[1][w]; }
+            run[0] += tg;
+            run[1] += te;
+        }
+        __syncthreads();
+    }
+    // sort descending by (key, lower index first); entries >= k are padding
+    if (tid >= k) { ckey[tid] = 0u; cidx[tid] = 0x7fffffff; }
+    __syncthreads();
+    for (int sz = 2; sz <= TOPK_MAX; sz <<= 1)
+        for (int st = sz >> 1; st > 0; st >>= 1) {
+            const int j = tid ^ st;
+            if (j > tid) {
+                const bool desc_dir = (tid & sz) == 0;
+                const uint32_t ka = ckey[tid], kb = ckey[j];
+                const int32_t ia = cidx[tid], ib = cidx[j];
+                const bool a_first = ka > kb || (ka == kb && ia < ib);   // a before b in the final order
+                if (desc_dir ? !a_first : a_first) {
+                    ckey[tid] = kb; ckey[j] = ka;
+                    cidx[tid] = ib; cidx[j] = ia;
+                }
+            }
+            __syncthreads();
+        }
+    if (tid < k) {
+        const uint32_t key = ckey[tid];
+        const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+        out_v[(size_t) blockIdx.x * k + tid] = __uint_as_float(u);
+        out_i[(size_t) blockIdx.x * k + tid] = cidx[tid];
+    }
+}
+
 /// Resident experts: entry j's up / down pointers and scale_2 from the routed id ids[j].
 __global__ void resident_ptrs_kernel(const int32_t* __restrict__ ids, const uint8_t* base, uint64_t stride,
                                      uint64_t ub, const float* __restrict__ s_up, const float* __restrict__ s_dn,
@@ -225,6 +332,11 @@ void nemo_layer_norm_rows(const float* x, const float* w, float* out, int64_t T,
 
 void nemo_argmax_rows(const float* x, int64_t T, int64_t n, int32_t* out, void* stream, float* prob) {
     if (T > 0) argmax_kernel<<<(unsigned) T, 1024, 0, (cudaStream_t) stream>>>(x, n, out, prob);
+}
+
+void nemo_topk_rows(const float* x, int64_t T, int64_t n, int k, float* out_v, int32_t* out_i, void* stream) {
+    if (T > 0 && k > 0 && k <= TOPK_MAX && k <= n)
+        topk_kernel<<<(unsigned) T, 1024, 0, (cudaStream_t) stream>>>(x, n, k, out_v, out_i);
 }
 
 void nemo_resident_expert_ptrs(const int32_t* ids, const uint8_t* base, uint64_t stride, uint64_t ub,
