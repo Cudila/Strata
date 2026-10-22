@@ -24,6 +24,7 @@
 // Usage: strata-nemotron --gguf FILE [--experts-gguf FILE] [--max-context N] [--chunk N] [--vram-reserve-mib N] [--expert-slots N]
 //                        [--kv-base N] [--spec N] [--tail-skip R] [--prefetch 0|1] [--prefetch-rank R]
 //                        (--serve | --ppl IDS [--ctx 1024] [--chunks 16] | --bench IDS [--ctx N] [--gen N] [--temp T])
+#include "strata/core/nemo_conv_cache.hpp"
 #include "strata/core/nemo_model.hpp"
 
 #include <cuda_runtime.h>
@@ -209,6 +210,8 @@ int run_ppl(strata::core::NemoModel& m, const char* path, int64_t ctx, int64_t c
 }
 
 int g_spec = 0;   ///< --spec N: drafts a window (serve), 0 = no speculation
+strata::core::ConversationCache g_cc;   ///< --prompt-cache N / --conversation-cache-mib X (docs/nemotron/CONV_CACHE.md)
+int64_t g_every = 16384;                ///< --prompt-cache-every M: a checkpoint every M tokens of a long read (0 = off)
 
 int run_serve(strata::core::NemoModel& m) {
     std::signal(SIGPIPE, SIG_IGN);
@@ -287,6 +290,7 @@ int run_serve(strata::core::NemoModel& m) {
         std::string tok, ids_s, emb_path;
         std::vector<std::string> img_keys;
         bool sampled = false;
+        int nocache = 0;
         while (ss >> tok) {
             const size_t eq = tok.find('=');
             if (eq == std::string::npos) {
@@ -300,6 +304,7 @@ int run_serve(strata::core::NemoModel& m) {
                 for (std::string kk; std::getline(ks, kk, ',');) img_keys.push_back(kk);
                 continue;
             }
+            if (k == "nocache") { nocache = std::atoi(v.c_str()); continue; }   // debugging: 1 = a cold read, 2 = the single snapshot of before
             if (k == "temperature") { sp.temperature = (float) std::atof(v.c_str()); sampled = sp.temperature > 0; }
             else if (k == "top_p") sp.top_p = (float) std::atof(v.c_str());
             else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
@@ -352,11 +357,16 @@ int run_serve(strata::core::NemoModel& m) {
         const auto key_of = [&](size_t i) { return i < img_keys.size() ? img_keys[i] : std::string("?"); };
         // reuse: the previous prompt is a prefix of this one, its pictures the same ones
         size_t reused = 0;
-        bool cont = !snap_prompt.empty() && m.snapshot_pos() == (int64_t) snap_prompt.size() &&
-                    snap_prompt.size() <= prompt.size() &&
-                    std::equal(snap_prompt.begin(), snap_prompt.end(), prompt.begin());
-        for (size_t i = 0; cont && i < snap_keys.size(); ++i)
-            cont = snap_keys[i] != "?" && key_of(i) == snap_keys[i];
+        const bool cc_on = g_cc.enabled() && nocache == 0;
+        const strata::core::ConvImages cimg{&runs, &img_keys};
+        bool cont = false;
+        if (!cc_on && nocache != 1) {
+            cont = !snap_prompt.empty() && m.snapshot_pos() == (int64_t) snap_prompt.size() &&
+                   snap_prompt.size() <= prompt.size() &&
+                   std::equal(snap_prompt.begin(), snap_prompt.end(), prompt.begin());
+            for (size_t i = 0; cont && i < snap_keys.size(); ++i)
+                cont = snap_keys[i] != "?" && key_of(i) == snap_keys[i];
+        }
         // the snapshot goes at the end of the prompt's last COMPLETE message (after its <|im_end|> and newline), not at
         // the prompt's end: the next turn re-renders this turn's generation prompt (<|im_start|>assistant\n<think>\n)
         // as the answer it became, so only the messages before it are a prefix the next prompt will share
@@ -368,21 +378,47 @@ int run_serve(strata::core::NemoModel& m) {
             }
         bool ok = true;
         int64_t at = 0;
-        if (cont && m.restore()) {
+        if (cc_on) {
+            // conversation cache: the deepest checkpoint (live, or a parked conversation's) that is a prefix of the prompt
+            g_cc.sync(m);
+            const auto ch = g_cc.choose(prompt, cimg);
+            if (ch.src == strata::core::ConversationCache::Choice::Live) {
+                // a branch before the deepest checkpoint overwrites cells the other branch needs: park it first
+                if (g_cc.deepest_live() > ch.len) g_cc.park_current(m, 0);
+                ok = g_cc.restore_live(m, ch.idx, logits, err);
+            } else {
+                g_cc.park_current(m, ch.src == strata::core::ConversationCache::Choice::Park ? ch.id : 0);
+                if (ch.src == strata::core::ConversationCache::Choice::Park) ok = g_cc.unpark(m, ch, logits, err);
+                else { m.reset(); g_cc.clear_live(); }
+            }
+            if (ok && ch.src != strata::core::ConversationCache::Choice::None) {
+                reused = (size_t) ch.len;
+                at = ch.len;
+            }
+            if (ok && ch.src != strata::core::ConversationCache::Choice::None)
+                std::fprintf(stderr, "strata-nemotron: conv-cache: %s checkpoint at %lld of %zu tokens, restore %.1f ms\n",
+                             ch.src == strata::core::ConversationCache::Choice::Live ? "live" : "parked",
+                             (long long) ch.len, prompt.size(), g_cc.last_restore_ms);
+        } else if (cont && m.restore()) {
             reused = snap_prompt.size();
             at = (int64_t) reused;
         } else {
             m.reset();
         }
-        const auto feed = [&](int64_t upto) {   // the prompt from `at` to `upto`
-            if (ok && upto > at) {
-                ok = m.forward(prompt.data() + at, upto - at, logits.data(), err);
-                at = upto;
+        const auto feed = [&](int64_t upto) {   // the prompt from `at` to `upto`, a checkpoint every g_every tokens
+            while (ok && upto > at) {
+                int64_t to = upto;
+                if (cc_on && g_every > 0) to = std::min(upto, (at / g_every + 1) * g_every);
+                ok = m.forward(prompt.data() + at, to - at, logits.data(), err);
+                at = to;
+                if (ok && cc_on && g_every > 0 && at < upto && at % g_every == 0)
+                    ok = g_cc.take(m, prompt.data(), cimg, strata::core::ConversationCache::Chunk, err);
             }
         };
-        if (boundary > at) {
+        if (ok && boundary > at) {
             feed(boundary);
-            if (ok) {
+            if (ok && cc_on) ok = g_cc.take(m, prompt.data(), cimg, strata::core::ConversationCache::Message, err);
+            else if (ok) {
                 m.snapshot();
                 snap_prompt.assign(prompt.begin(), prompt.begin() + boundary);
                 snap_keys.clear();   // the pictures the snapshot has read
@@ -391,12 +427,19 @@ int run_serve(strata::core::NemoModel& m) {
             }
         }
         feed((int64_t) prompt.size());
-        if (ok && at == (int64_t) reused && reused == prompt.size()) logits = m.snapshot_logits();
+        if (ok && !cc_on && at == (int64_t) reused && reused == prompt.size()) logits = m.snapshot_logits();
         if (!ok) {
             snap_prompt.clear();
+            g_cc.clear_live();
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
+        }
+        if (const char* dl = std::getenv("STRATA_NEMO_DUMP_LOGITS")) {   // debugging: the logits after the prompt
+            if (FILE* f = std::fopen(dl, "ab")) {
+                std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, f);
+                std::fclose(f);
+            }
         }
         const double prompt_ms = ms_since(t0);
         std::printf("REUSED %zu\n", reused);
@@ -405,27 +448,39 @@ int run_serve(strata::core::NemoModel& m) {
         const uint64_t spec_w0 = sp0.spec_windows, spec_a0 = sp0.spec_accepted, spec_d0 = sp0.spec_drafted;
         long long produced = 0;
         const char* finish = "length";
+        std::vector<int32_t> gen_ids, got;   // emitted tokens; the spec window's kept tokens not yet emitted (reversed)
         if (g_spec > 0 && m.has_mtp()) {
             // speculation: the first token from the prompt's logits, then windows of MTP drafts verified at once
             const std::function<int32_t(const float*)> pick = [&](const float* lg) { return sample(lg, n_vocab, sp, rng); };
             int32_t id = sample(logits.data(), n_vocab, sp, rng);
-            std::vector<int32_t> got;
             for (;;) {
                 std::printf("T %d\n", id);
                 std::fflush(stdout);
                 ++produced;
+                gen_ids.push_back(id);
                 if (std::find(eos.begin(), eos.end(), id) != eos.end()) { finish = "stop"; break; }
                 if (produced >= max_new) break;
                 if (got.empty()) {
                     if (stop_req.load()) { finish = "cancel"; break; }
                     if (m.pos() + 1 > m.max_context()) { finish = "length"; break; }
-                    const int nd = (int) std::min<int64_t>(g_spec, m.max_context() - m.pos() - 1);
-                    if (!m.spec_step(id, nd, got, err, sp.temperature > 0 ? &pick : nullptr)) {
+                    int64_t nd = std::min<int64_t>(g_spec, m.max_context() - m.pos() - 1);
+                    // conversation cache: a window must not feed tokens past max_new (the next prompt would not
+                    // have them): at most max_new - produced more tokens are emitted, a window emits nd + 1
+                    if (cc_on) nd = std::min<int64_t>(nd, max_new - produced - 1);
+                    if (nd <= 0 && cc_on) {   // the last token: one plain step
+                        if (!m.forward(&id, 1, logits.data(), err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            ok = false;
+                            break;
+                        }
+                        got.assign(1, sample(logits.data(), n_vocab, sp, rng));
+                    } else if (!m.spec_step(id, (int) nd, got, err, sp.temperature > 0 ? &pick : nullptr)) {
                         std::printf("ERR %s\n", err.c_str());
                         ok = false;
                         break;
+                    } else {
+                        std::reverse(got.begin(), got.end());
                     }
-                    std::reverse(got.begin(), got.end());
                 }
                 id = got.back();
                 got.pop_back();
@@ -437,6 +492,7 @@ int run_serve(strata::core::NemoModel& m) {
             std::printf("T %d\n", id);
             std::fflush(stdout);
             ++produced;
+            gen_ids.push_back(id);
             if (std::find(eos.begin(), eos.end(), id) != eos.end()) { finish = "stop"; break; }
             if (produced >= max_new) break;
             if (m.pos() + 1 > m.max_context()) { finish = "length"; break; }
@@ -453,6 +509,20 @@ int run_serve(strata::core::NemoModel& m) {
                     finish, reused, (unsigned long long) s2.expert_hits,
                     (unsigned long long) (s2.expert_hits + s2.expert_misses));
         std::fflush(stdout);
+        if (cc_on) {
+            // after the answer: the next turn that extends it verbatim resumes here.  The tokens the model has fed are
+            // the prompt and a prefix of the generated ones (emitted, then the kept ones not emitted yet)
+            std::vector<int32_t> seq = prompt;
+            seq.insert(seq.end(), gen_ids.begin(), gen_ids.end());
+            seq.insert(seq.end(), got.rbegin(), got.rend());
+            if (m.pos() >= (int64_t) prompt.size() && m.pos() <= (int64_t) seq.size()) {
+                std::string cerr;
+                if (!g_cc.take(m, seq.data(), cimg, strata::core::ConversationCache::Answer, cerr)) {
+                    std::fprintf(stderr, "strata-nemotron: conv-cache: %s\n", cerr.c_str());
+                    g_cc.clear_live();
+                }
+            }
+        }
         if (s2.spec_windows > spec_w0)
             std::fprintf(stderr, "strata-nemotron: drafts accepted %llu of %llu (%llu windows)\n",
                          (unsigned long long) (s2.spec_accepted - spec_a0), (unsigned long long) (s2.spec_drafted - spec_d0),
@@ -606,6 +676,8 @@ int main(int argc, char** argv) {
     int64_t ctx = 1024, chunks = 16, gen = 256;
     int probe = 0, spec = 0;
     float bench_temp = 0.0f;
+    int cc_n = 0;
+    int64_t cc_mib = 0;
     const char* spec_list = nullptr;
     const char* minp_list = nullptr;
     bool bos_first = true, ppl_decode = false, ctx_given = false;
@@ -642,6 +714,9 @@ int main(int argc, char** argv) {
         else if (a == "--skip-w") setenv("STRATA_NEMO_SKIP_W", next(), 1);
         else if (a == "--prompt-skip-w") setenv("STRATA_NEMO_PROMPT_SKIP_W", next(), 1);
         else if (a == "--prompt-skip-max") setenv("STRATA_NEMO_PROMPT_SKIP_MAX", next(), 1);
+        else if (a == "--prompt-cache") cc_n = std::atoi(next());
+        else if (a == "--prompt-cache-every") g_every = std::atoll(next());
+        else if (a == "--conversation-cache-mib") cc_mib = std::atoll(next());
         else if (a == "--temp") bench_temp = (float) std::atof(next());
         else if (a == "--spec-list") { spec_list = next(); o.mtp = true; }
         else if (a == "--min-p-list") minp_list = next();
@@ -689,6 +764,17 @@ int main(int argc, char** argv) {
                          "(%.1f GiB), K/V %lld cells (grows to %lld), experts %s\n", ms_since(t0) / 1000.0,
                  st.dense_gib, (long long) st.slots_per_layer, st.expert_cache_gib, (long long) st.kv_cells,
                  (long long) m.max_context(), st.pinned ? "page-locked in place" : "NOT page-locked");
+    if (serve && (cc_n > 0 || cc_mib > 0)) {
+        if (cc_mib > 0 && cc_n < 2) cc_n = 2;   // parking needs the checkpoints
+        std::string cerr;
+        const auto tc = Clock::now();
+        if (!g_cc.init(m, cc_n, cc_mib, cerr))
+            std::fprintf(stderr, "strata-nemotron: conversation cache off: %s\n", cerr.c_str());
+        else
+            std::fprintf(stderr, "strata-nemotron: conversation cache: %d checkpoints every %lld tokens, park %lld MiB "
+                                 "(pools allocated in %.1f s)\n", cc_n, (long long) g_every, (long long) cc_mib,
+                         ms_since(tc) / 1000.0);
+    }
     if (bench) {
         // a sweep: every (spec, min_p) of --spec-list / --min-p-list over every file of a comma-separated --bench
         std::vector<std::string> files;

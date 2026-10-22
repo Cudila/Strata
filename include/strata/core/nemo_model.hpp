@@ -56,6 +56,21 @@ struct NemoStats {
     bool pinned = false;
 };
 
+/// A checkpoint of the model's recurrent state at one position (conversation cache, nemo_conv_cache.hpp): the Mamba
+/// state and conv of all 40 blocks in `mamba` (page-locked host memory the caller owns, NemoModel::ckpt_bytes()),
+/// the MTP pending row, the position and the head logits there.  The K/V cells are not part of it: they are
+/// positional, valid while NemoModel::kv_gen() is the generation the checkpoint was taken in.
+struct NemoCkpt {
+    uint8_t* mamba = nullptr;
+    std::vector<float> mtp_h;
+    bool mtp_pending = false;
+    int64_t mtp_pending_pos = -1;
+    int32_t mtp_consumed = -1;
+    int64_t pos = -1;
+    std::vector<float> logits;
+    uint64_t kv_gen = 0;
+};
+
 class NemoModel {
 public:
     NemoModel();
@@ -88,6 +103,21 @@ public:
     int64_t snapshot_pos() const { return snap_pos_; }
     const std::vector<float>& snapshot_logits() const { return snap_logits_; }
 
+    /// Checkpoints (conversation cache).  `ckpt_bytes()` is the size of NemoCkpt::mamba.  checkpoint_save copies the
+    /// current state D2H into c.mamba (c.mamba must be set); checkpoint_restore puts it back (state, MTP row, pos, the
+    /// head logits) - the K/V cells below c.pos must still be those of the checkpoint's sequence (kv_gen() == c.kv_gen,
+    /// or restored with kv_restore).
+    size_t ckpt_bytes() const;
+    bool checkpoint_save(NemoCkpt& c, std::string& err);
+    bool checkpoint_restore(const NemoCkpt& c, std::string& err);
+    /// Bumped by reset(): K/V cells written before it are gone (a checkpoint of an older generation cannot be used).
+    uint64_t kv_gen() const { return kv_gen_; }
+    /// K/V cells [0, cells) of every owner (8 attention blocks and the MTP) to / from `buf` (kv_cell_bytes() * cells,
+    /// page-locked), only the used part of each page.  kv_restore grows the cache as needed.
+    uint64_t kv_cell_bytes() const;
+    bool kv_save(int64_t cells, uint8_t* buf, std::string& err);
+    bool kv_restore(int64_t cells, const uint8_t* buf, std::string& err);
+
     /// The MTP block: whether it is loaded, and a draft chain - n greedy drafts for the tokens after `next` (the token
     /// about to be fed: the last forward's sampled token).  It writes the MTP's K/V at the positions it drafts for;
     /// the next forward() keeps the first (it is the true one when `next` is fed).
@@ -112,6 +142,7 @@ private:
     std::unique_ptr<Impl> impl_;
     NemotronGeometry g_;
     int64_t max_ctx_ = 0, pos_ = 0, snap_pos_ = -1;
+    uint64_t kv_gen_ = 1;
     std::vector<float> snap_logits_;
     NemoStats stats_;
 };

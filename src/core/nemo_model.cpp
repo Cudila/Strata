@@ -1478,6 +1478,7 @@ void NemoModel::reset() {
         }
     cudaStreamSynchronize(I.st);
     pos_ = 0;
+    ++kv_gen_;        // the K/V cells of the old sequence are overwritten from here on
     snap_pos_ = -1;   // a new sequence overwrites the K/V cells a snapshot relied on
     I.mtp.pending = false;
     I.mtp.consumed_tok = -1;
@@ -1525,6 +1526,125 @@ bool NemoModel::restore() {
     }
     cudaStreamSynchronize(I.st);
     pos_ = snap_pos_;
+    return true;
+}
+
+// ---- conversation cache: checkpoints and K/V cells (nemo_conv_cache.cpp holds the host side) ----
+
+size_t NemoModel::ckpt_bytes() const {
+    const size_t per = sizeof(float) * (size_t) (g_.ssm_n_head * g_.ssm_head_dim() * g_.ssm_d_state +
+                                                g_.ssm_conv_dim() * (g_.ssm_d_conv - 1));
+    return per * (size_t) g_.count(NemotronBlock::Mamba);
+}
+
+bool NemoModel::checkpoint_save(NemoCkpt& c, std::string& err) {
+    Impl& I = *impl_;
+    if (!c.mamba) { err = "checkpoint without a buffer"; return false; }
+    const size_t sb = sizeof(float) * g_.ssm_n_head * g_.ssm_head_dim() * g_.ssm_d_state;
+    const size_t cb = sizeof(float) * g_.ssm_conv_dim() * (g_.ssm_d_conv - 1);
+    uint8_t* d = c.mamba;
+    for (Block& b : I.blocks)
+        if (b.kind == NemotronBlock::Mamba) {
+            NCK(cudaMemcpyAsync(d, b.state, sb, cudaMemcpyDeviceToHost, I.st));
+            NCK(cudaMemcpyAsync(d + sb, b.conv, cb, cudaMemcpyDeviceToHost, I.st));
+            d += sb + cb;
+        }
+    c.mtp_h.clear();
+    c.mtp_pending = false;
+    c.mtp_pending_pos = -1;
+    c.mtp_consumed = -1;
+    if (I.mtp.on) {
+        c.mtp_h.resize((size_t) g_.n_embd);
+        NCK(cudaMemcpyAsync(c.mtp_h.data(), I.mtp.h, sizeof(float) * g_.n_embd, cudaMemcpyDeviceToHost, I.st));
+        c.mtp_pending = I.mtp.pending;
+        c.mtp_pending_pos = I.mtp.pending_pos;
+        c.mtp_consumed = I.mtp.consumed_tok;
+    }
+    c.logits.resize((size_t) g_.n_vocab);
+    NCK(cudaMemcpyAsync(c.logits.data(), I.head_out, sizeof(float) * g_.n_vocab, cudaMemcpyDeviceToHost, I.st));
+    NCK(cudaStreamSynchronize(I.st));
+    c.pos = pos_;
+    c.kv_gen = kv_gen_;
+    return true;
+}
+
+bool NemoModel::checkpoint_restore(const NemoCkpt& c, std::string& err) {
+    Impl& I = *impl_;
+    if (!c.mamba || c.pos < 0) { err = "empty checkpoint"; return false; }
+    const size_t sb = sizeof(float) * g_.ssm_n_head * g_.ssm_head_dim() * g_.ssm_d_state;
+    const size_t cb = sizeof(float) * g_.ssm_conv_dim() * (g_.ssm_d_conv - 1);
+    NCK(cudaStreamSynchronize(I.st));
+    const uint8_t* d = c.mamba;
+    for (Block& b : I.blocks)
+        if (b.kind == NemotronBlock::Mamba) {
+            NCK(cudaMemcpyAsync(b.state, d, sb, cudaMemcpyHostToDevice, I.st));
+            NCK(cudaMemcpyAsync(b.conv, d + sb, cb, cudaMemcpyHostToDevice, I.st));
+            d += sb + cb;
+        }
+    if (I.mtp.on) {
+        if (c.mtp_h.size() == (size_t) g_.n_embd)
+            NCK(cudaMemcpyAsync(I.mtp.h, c.mtp_h.data(), sizeof(float) * g_.n_embd, cudaMemcpyHostToDevice, I.st));
+        I.mtp.pending = c.mtp_pending;
+        I.mtp.pending_pos = c.mtp_pending_pos;
+        I.mtp.consumed_tok = c.mtp_consumed;
+    }
+    if (c.logits.size() == (size_t) g_.n_vocab)
+        NCK(cudaMemcpyAsync(I.head_out, c.logits.data(), sizeof(float) * g_.n_vocab, cudaMemcpyHostToDevice, I.st));
+    NCK(cudaStreamSynchronize(I.st));
+    pos_ = c.pos;
+    return true;
+}
+
+uint64_t NemoModel::kv_cell_bytes() const {
+    const Impl& I = *impl_;
+    return (uint64_t) I.kv_lists.size() * (uint64_t) (I.kd * (1 + 2) + I.n_kv_heads * 4);
+}
+
+bool NemoModel::kv_save(int64_t cells, uint8_t* buf, std::string& err) {
+    Impl& I = *impl_;
+    if (cells < 0 || cells > (I.kv_pages << I.kv_shift)) { err = "kv_save: more cells than the cache holds"; return false; }
+    NCK(cudaStreamSynchronize(I.st));
+    NCK(cudaStreamSynchronize(I.cst));
+    const int64_t kd = I.kd, nh = I.n_kv_heads, pc = 1ll << I.kv_shift;
+    uint8_t* d = buf;
+    for (KvPages* l : I.kv_lists) {
+        uint8_t* kd_ = d;
+        uint8_t* ksd = kd_ + (size_t) cells * kd;
+        uint8_t* vd = ksd + (size_t) cells * nh * sizeof(float);
+        for (int64_t p = 0; p * pc < cells; ++p) {
+            const int64_t n = std::min<int64_t>(pc, cells - p * pc);
+            NCK(cudaMemcpyAsync(kd_ + (size_t) p * pc * kd, l->k[(size_t) p], (size_t) n * kd, cudaMemcpyDeviceToHost, I.st));
+            NCK(cudaMemcpyAsync(ksd + (size_t) p * pc * nh * 4, l->ks[(size_t) p], (size_t) n * nh * 4, cudaMemcpyDeviceToHost, I.st));
+            NCK(cudaMemcpyAsync(vd + (size_t) p * pc * kd * 2, l->v[(size_t) p], (size_t) n * kd * 2, cudaMemcpyDeviceToHost, I.st));
+        }
+        d = vd + (size_t) cells * kd * 2;
+    }
+    NCK(cudaStreamSynchronize(I.st));
+    return true;
+}
+
+bool NemoModel::kv_restore(int64_t cells, const uint8_t* buf, std::string& err) {
+    Impl& I = *impl_;
+    if (cells < 0 || cells > max_ctx_) { err = "kv_restore: more cells than the context"; return false; }
+    if (!I.kv_grow(std::min<int64_t>(cells + 16, max_ctx_), err)) return false;
+    stats_.slots_per_layer = I.slots;
+    stats_.kv_cells = I.kv_pages << I.kv_shift;
+    NCK(cudaStreamSynchronize(I.st));
+    const int64_t kd = I.kd, nh = I.n_kv_heads, pc = 1ll << I.kv_shift;
+    const uint8_t* d = buf;
+    for (KvPages* l : I.kv_lists) {
+        const uint8_t* kd_ = d;
+        const uint8_t* ksd = kd_ + (size_t) cells * kd;
+        const uint8_t* vd = ksd + (size_t) cells * nh * sizeof(float);
+        for (int64_t p = 0; p * pc < cells; ++p) {
+            const int64_t n = std::min<int64_t>(pc, cells - p * pc);
+            NCK(cudaMemcpyAsync(l->k[(size_t) p], kd_ + (size_t) p * pc * kd, (size_t) n * kd, cudaMemcpyHostToDevice, I.st));
+            NCK(cudaMemcpyAsync(l->ks[(size_t) p], ksd + (size_t) p * pc * nh * 4, (size_t) n * nh * 4, cudaMemcpyHostToDevice, I.st));
+            NCK(cudaMemcpyAsync(l->v[(size_t) p], vd + (size_t) p * pc * kd * 2, (size_t) n * kd * 2, cudaMemcpyHostToDevice, I.st));
+        }
+        d = vd + (size_t) cells * kd * 2;
+    }
+    NCK(cudaStreamSynchronize(I.st));
     return true;
 }
 

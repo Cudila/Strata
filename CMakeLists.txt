@@ -1107,7 +1107,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
     # the engine process for Nemotron-H GGUFs (src/program/nemo_main.cpp): its own binary, nothing of the qwen4exp
     # engine links it
-    add_executable(strata-nemotron src/program/nemo_main.cpp src/core/nemo_model.cpp)
+    add_executable(strata-nemotron src/program/nemo_main.cpp src/core/nemo_model.cpp src/core/nemo_conv_cache.cpp)
     target_include_directories(strata-nemotron PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(strata-nemotron PRIVATE strata_nemotron strata_nemotron_kernels ${_strata_gpu_runtime_target}
                           Threads::Threads)
