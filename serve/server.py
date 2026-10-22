@@ -2440,7 +2440,8 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
+        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to BMP
+        (uncompressed: a PNG encode here and the PNG decode in stb cost tens of ms for nothing).
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
@@ -2467,7 +2468,7 @@ class Vision:
         elif im.mode != "RGB":
             im = im.convert("RGB")
         out = io.BytesIO()
-        im.save(out, format="PNG")
+        im.save(out, format="BMP")                       # 24-bit, uncompressed; stb_image reads it
         return out.getvalue()
 
     def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:

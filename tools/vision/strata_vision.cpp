@@ -26,6 +26,7 @@
 #endif
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,7 +80,21 @@ void nvidia_tile(int w, int h, int& wp, int& hp) {
     hp = (int) th;
 }
 
-// torch's antialiased bicubic (PIL's filter: a = -0.5, support 2 x the downscale), along one axis of a float image
+// torch's antialiased bicubic (PIL's filter: a = -0.5, support 2 x the downscale), along one axis of a float image.
+// The arithmetic is unchanged from the single-threaded version (double sums, taps added in ascending order), so the
+// bytes are identical; only the work is split over threads.  An axis whose length does not change is the identity
+// (the weights come out exactly 0, 1, 0, 0) and the caller skips it.
+void parallel_for(int n, int n_threads, const std::function<void(int, int)>& fn) {
+    n_threads = std::max(1, std::min(n_threads, n));
+    if (n_threads == 1) { fn(0, n); return; }
+    std::vector<std::thread> pool;
+    for (int t = 0; t < n_threads; ++t) {
+        const int lo = (int) ((long long) n * t / n_threads), hi = (int) ((long long) n * (t + 1) / n_threads);
+        pool.emplace_back([&fn, lo, hi] { fn(lo, hi); });
+    }
+    for (auto& th : pool) th.join();
+}
+
 void aa_axis(const std::vector<float>& in, int w, int h, int c, int out_len, bool horizontal, std::vector<float>& out) {
     const int in_len = horizontal ? w : h;
     const double scale = (double) in_len / out_len, fs = std::max(scale, 1.0), support = 2.0 * fs;
@@ -91,26 +106,53 @@ void aa_axis(const std::vector<float>& in, int w, int h, int c, int out_len, boo
     };
     const int ow = horizontal ? out_len : w, oh = horizontal ? h : out_len;
     out.assign((size_t) ow * oh * c, 0.0f);
-    std::vector<double> wt;
+    // the taps of every output position, computed once
+    std::vector<int> first(out_len), count(out_len);
+    std::vector<size_t> at(out_len);
+    std::vector<double> wts;
     for (int i = 0; i < out_len; ++i) {
         const double center = scale * (i + 0.5);
         const int x0 = std::max((int) (center - support + 0.5), 0);
         const int x1 = std::min((int) (center + support + 0.5), in_len);
-        wt.assign((size_t) (x1 - x0), 0.0);
+        first[i] = x0;
+        count[i] = x1 - x0;
+        at[i] = wts.size();
         double total = 0.0;
-        for (int j = x0; j < x1; ++j) total += wt[(size_t) (j - x0)] = cubic((j - center + 0.5) / fs);
-        for (double& v : wt) v = total != 0.0 ? v / total : 0.0;
-        const int other = horizontal ? h : w;
-        for (int o = 0; o < other; ++o)
-            for (int ch = 0; ch < c; ++ch) {
-                double s = 0.0;
-                for (int j = x0; j < x1; ++j) {
-                    const size_t src = horizontal ? ((size_t) o * w + j) * c + ch : ((size_t) j * w + o) * c + ch;
-                    s += wt[(size_t) (j - x0)] * in[src];
+        for (int j = x0; j < x1; ++j) {
+            const double v = cubic((j - center + 0.5) / fs);
+            total += v;
+            wts.push_back(v);
+        }
+        for (int j = x0; j < x1; ++j) {
+            double& v = wts[at[i] + (size_t) (j - x0)];
+            v = total != 0.0 ? v / total : 0.0;
+        }
+    }
+    const int n_threads = (int) std::max(4u, std::thread::hardware_concurrency() / 2);
+    if (horizontal) {   // split by rows: each row is read and written contiguously
+        parallel_for(h, n_threads, [&](int r0, int r1) {
+            for (int o = r0; o < r1; ++o)
+                for (int i = 0; i < out_len; ++i) {
+                    const double* wt = &wts[at[i]];
+                    for (int ch = 0; ch < c; ++ch) {
+                        double s = 0.0;
+                        for (int k = 0; k < count[i]; ++k) s += wt[k] * in[((size_t) o * w + first[i] + k) * c + ch];
+                        out[((size_t) o * ow + i) * c + ch] = (float) s;
+                    }
                 }
-                const size_t dst = horizontal ? ((size_t) o * ow + i) * c + ch : ((size_t) i * ow + o) * c + ch;
-                out[dst] = (float) s;
+        });
+    } else {            // split by output rows
+        parallel_for(out_len, n_threads, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                const double* wt = &wts[at[i]];
+                for (int o = 0; o < w; ++o)
+                    for (int ch = 0; ch < c; ++ch) {
+                        double s = 0.0;
+                        for (int k = 0; k < count[i]; ++k) s += wt[k] * in[((size_t) (first[i] + k) * w + o) * c + ch];
+                        out[((size_t) i * ow + o) * c + ch] = (float) s;
+                    }
             }
+        });
     }
 }
 
@@ -123,8 +165,9 @@ std::vector<unsigned char> nvidia_resize(const unsigned char* rgb, int w, int h,
     if (ow == w && oh == h) return {};
     std::vector<float> a((size_t) w * h * 3), b, d;
     for (size_t i = 0; i < a.size(); ++i) a[i] = rgb[i];
-    aa_axis(a, w, h, 3, ow, true, b);    // torch: width first, then height
-    aa_axis(b, ow, h, 3, oh, false, d);
+    // torch: width first, then height; an axis that keeps its length is passed through untouched
+    if (ow != w) aa_axis(a, w, h, 3, ow, true, b); else b = std::move(a);
+    if (oh != h) aa_axis(b, ow, h, 3, oh, false, d); else d = std::move(b);
     std::vector<unsigned char> out(d.size());
     for (size_t i = 0; i < d.size(); ++i) out[i] = (unsigned char) std::clamp(std::lround(d[i]), 0L, 255L);
     return out;
@@ -199,11 +242,13 @@ int main(int argc, char** argv) {
     cp.use_gpu = gpu;
     cp.print_timings = false;
     cp.warmup = false;
-    // On the CPU "auto" turns flash attention on.  ggml's fast (tiled) CPU kernel for it needs the head size, 72 in this
-    // encoder, to be a multiple of the vector width: 8 floats with AVX2 (the release builds), 16 with AVX-512 (a build
-    // from source on a CPU that has it), where ggml falls back to a kernel that is several times slower and accumulates
-    // in FP16.  A 1024x1024 picture on a Ryzen 7 7700X, 8 threads: AVX2 8-10 s with it, 14-15 s without; AVX-512 44 s
-    // with it (26% off the FP32 attention's output), 13 s without.
+    // On the CPU "auto" turns flash attention on.  ggml's fast (tiled) CPU kernel for it needs the head size to be a
+    // multiple of the vector width: 8 floats with AVX2 (the release builds), 16 with AVX-512 (a build from source on a
+    // CPU that has it), where ggml falls back to a kernel that is several times slower and accumulates in FP16.  A
+    // 1024x1024 picture on a Ryzen 7 7700X, 8 threads: AVX2 8-10 s with it, 14-15 s without; AVX-512 44 s with it
+    // (26% off the FP32 attention's output), 13 s without.  Those numbers were taken with the Qwen vision tower (head
+    // size 72, not a multiple of 16).  RADIO-H's head is 80 (1280/16), a multiple of 16, so the explanation does not
+    // carry over to this encoder; the AVX-512 default stays until it is measured here.
     if (!gpu && !fa_given && ggml_cpu_has_avx512()) fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.flash_attn_type = fa;
     // on the CPU without --threads: one per core (mtmd's own default is 4 threads)
@@ -271,19 +316,34 @@ int main(int argc, char** argv) {
         std::string img, out;
         if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = std::chrono::steady_clock::now();
+        auto tms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        double dec_ms = 0, rs_ms = 0, tok_ms = 0, enc_ms = 0;
+        int src_w = 0, src_h = 0, out_w = 0, out_h = 0;
         mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
                                                                             mtmd_helper_init_opt_default());
+        const auto t_dec = std::chrono::steady_clock::now();
+        dec_ms = tms(t0, t_dec);
         if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
+        src_w = (int) mtmd_bitmap_get_nx(bw.bitmap); src_h = (int) mtmd_bitmap_get_ny(bw.bitmap);
+        out_w = src_w; out_h = src_h;
         if (nemotron) {   // NVIDIA's tile (see nvidia_resize); mtmd keeps a tile of that size as it is
             int ow = 0, oh = 0;
             const std::vector<unsigned char> px = nvidia_resize(mtmd_bitmap_get_data(bw.bitmap),
                                                                 (int) mtmd_bitmap_get_nx(bw.bitmap),
                                                                 (int) mtmd_bitmap_get_ny(bw.bitmap), ow, oh);
             if (!px.empty()) {
+                if (const char* dump = std::getenv("STRATA_VISION_DUMP_RGB")) {   // debug: the resized RGB bytes
+                    if (FILE* df = std::fopen(dump, "wb")) { std::fwrite(px.data(), 1, px.size(), df); std::fclose(df); }
+                }
                 mtmd_bitmap_free(bw.bitmap);
                 bw.bitmap = mtmd_bitmap_init((uint32_t) ow, (uint32_t) oh, px.data());
+                out_w = ow; out_h = oh;
             }
         }
+        const auto t_rs = std::chrono::steady_clock::now();
+        rs_ms = tms(t_dec, t_rs);
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         const std::string prompt = mtmd_default_marker();
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
@@ -291,12 +351,16 @@ int main(int argc, char** argv) {
         std::string err;
         const mtmd_input_chunk* ichunk = nullptr;
         if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
+        const auto t_tok = std::chrono::steady_clock::now();
+        tok_ms = tms(t_rs, t_tok);
         for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
             const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
             if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) ichunk = ch;
         }
         if (err.empty() && !ichunk) err = "no image chunk";
         if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
+        const auto t_enc = std::chrono::steady_clock::now();
+        enc_ms = tms(t_tok, t_enc);
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
@@ -316,6 +380,9 @@ int main(int argc, char** argv) {
                 const bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
                                 std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
                 std::fclose(f);
+                const auto t_wr = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "strata-vision: decode %.1f ms, resize %.1f ms, tokenize %.1f ms, encode %.1f ms, write %.1f ms, total %.1f ms (%d tokens, in %dx%d -> out %dx%d)\n",
+                             dec_ms, rs_ms, tok_ms, enc_ms, tms(t_enc, t_wr), tms(t0, t_wr), n, src_w, src_h, out_w, out_h);
                 if (!ok) err = "short write to " + out;
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
